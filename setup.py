@@ -59,7 +59,7 @@ setuptools.setup(
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
     ],
-    packages=setuptools.find_packages(),
+    packages=setuptools.find_packages(exclude = ['examples*','models*']),
     package_data={'tinynn': ['graph/configs/*.yml']},
     python_requires=">=3.6",
     install_requires=install_reqs,
