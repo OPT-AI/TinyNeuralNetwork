@@ -1,4 +1,5 @@
 import unittest
+from distutils.version import LooseVersion
 
 import torch
 import torch.nn as nn
@@ -768,6 +769,54 @@ class ConverterOptimizerTester(unittest.TestCase):
         self.assertEqual(tfl_model.Subgraphs(0).OperatorsLength(), 1)
         self.assertEqual(tfl_model.Subgraphs(0).Operators(0).OutputsLength(), 1)
 
+    def test_remove_elementwise_add_tile(self):
+        class TestModel(nn.Module):
+            def forward(self, x, y):
+                z = x + y.expand(1, -1, 2, 1)
+                return z
+
+        model = TestModel()
+        model.eval()
+
+        dummy_input = [torch.randn(1, 3, 2, 1), torch.randn(1, 3, 1, 1)]
+        model_path = get_model_path()
+
+        converter = TFLiteConverter(model, dummy_input, model_path, nchw_transpose=False)
+        converter.convert()
+
+        tfl_model = parse_model(model_path)
+        self.assertEqual(tfl_model.OperatorCodesLength(), 1)
+        self.assertEqual(tfl_model.OperatorCodes(0).DeprecatedBuiltinCode(), tflite.BuiltinOperator.ADD)
+        self.assertEqual(tfl_model.SubgraphsLength(), 1)
+        self.assertEqual(tfl_model.Subgraphs(0).InputsLength(), 2)
+        self.assertEqual(tfl_model.Subgraphs(0).OutputsLength(), 1)
+        self.assertEqual(tfl_model.Subgraphs(0).OperatorsLength(), 1)
+        self.assertEqual(tfl_model.Subgraphs(0).Operators(0).OutputsLength(), 1)
+
+    def test_remove_elementwise_mul_tile(self):
+        class TestModel(nn.Module):
+            def forward(self, x, y):
+                z = x.expand(1, -1, 2, 1) * y
+                return z
+
+        model = TestModel()
+        model.eval()
+
+        dummy_input = [torch.randn(1, 3, 1, 1), torch.randn(1, 3, 2, 1)]
+        model_path = get_model_path()
+
+        converter = TFLiteConverter(model, dummy_input, model_path, nchw_transpose=False)
+        converter.convert()
+
+        tfl_model = parse_model(model_path)
+        self.assertEqual(tfl_model.OperatorCodesLength(), 1)
+        self.assertEqual(tfl_model.OperatorCodes(0).DeprecatedBuiltinCode(), tflite.BuiltinOperator.MUL)
+        self.assertEqual(tfl_model.SubgraphsLength(), 1)
+        self.assertEqual(tfl_model.Subgraphs(0).InputsLength(), 2)
+        self.assertEqual(tfl_model.Subgraphs(0).OutputsLength(), 1)
+        self.assertEqual(tfl_model.Subgraphs(0).OperatorsLength(), 1)
+        self.assertEqual(tfl_model.Subgraphs(0).Operators(0).OutputsLength(), 1)
+
     def test_binary_elementwise_transpose_as_unary(self):
         class TestModel(nn.Module):
             def __init__(self) -> None:
@@ -1383,7 +1432,7 @@ class ConverterOptimizerTester(unittest.TestCase):
             tflite.BuiltinOperator.CONCATENATION,
         )
         self.assertEqual(tfl_model.Subgraphs(0).Operators(5).OutputsLength(), 1)
-    
+
     def test_fuse_transposeconv_relu(self):
         class TestModel(nn.Module):
             def __init__(self) -> None:
@@ -1394,7 +1443,7 @@ class ConverterOptimizerTester(unittest.TestCase):
 
             def forward(self, x):
                 y = self.act(self.transposeconv(x))
-                return  y
+                return y
 
         model = TestModel()
         model.eval()
@@ -1403,7 +1452,7 @@ class ConverterOptimizerTester(unittest.TestCase):
 
         converter = TFLiteConverter(model, dummy_input, model_path)
         converter.convert()
-        
+
         tfl_model = parse_model(model_path)
         self.assertEqual(tfl_model.OperatorCodesLength(), 1)
         self.assertEqual(tfl_model.OperatorCodes(0).DeprecatedBuiltinCode(), tflite.BuiltinOperator.TRANSPOSE_CONV)
@@ -2468,6 +2517,40 @@ class ConverterOptimizerQuantizedTester(unittest.TestCase):
         self.assertEqual(tfl_model.Subgraphs(0).InputsLength(), 1)
         self.assertEqual(tfl_model.Subgraphs(0).OutputsLength(), 1)
 
+    @unittest.skipIf(
+        LooseVersion(torch.__version__) < LooseVersion('1.8.0'),
+        "PixelUnshuffle is introduced in PyTorch 1.8.0",
+    )
+    def test_gather_conv2d(self):
+        class TestModel(nn.Module):
+            def __init__(self, with_bias=False):
+                super(TestModel, self).__init__()
+                self.block = nn.Sequential(
+                    nn.PixelUnshuffle(2),
+                    nn.Conv2d(8, 4, 3, 1, 1, bias=with_bias),
+                )
+
+            def forward(self, x):
+                return self.block(x)
+
+        model = TestModel()
+        model.eval()
+
+        dummy_input = torch.randn(1, 2, 512, 512)
+        model_path = get_model_path()
+
+        nchw_transpose = False
+        converter = TFLiteConverter(model, dummy_input, model_path, nchw_transpose=nchw_transpose)
+        converter.convert()
+
+        tfl_model = parse_model(model_path)
+        self.assertEqual(tfl_model.OperatorCodesLength(), 4)
+        self.assertEqual(tfl_model.OperatorCodes(1).DeprecatedBuiltinCode(), tflite.BuiltinOperator.SPACE_TO_DEPTH)
+        self.assertEqual(tfl_model.OperatorCodes(2).DeprecatedBuiltinCode(), tflite.BuiltinOperator.CONV_2D)
+        self.assertEqual(tfl_model.SubgraphsLength(), 1)
+        self.assertEqual(tfl_model.Subgraphs(0).InputsLength(), 1)
+        self.assertEqual(tfl_model.Subgraphs(0).OutputsLength(), 1)
+
     def test_lower_transpose_dim_pass(self):
         class TestModel(nn.Module):
             def forward(self, x):
@@ -2544,6 +2627,32 @@ class ConverterOptimizerQuantizedTester(unittest.TestCase):
         self.assertEqual(tfl_model.Subgraphs(0).InputsLength(), 1)
         self.assertEqual(tfl_model.Subgraphs(0).OutputsLength(), 1)
         self.assertEqual(tfl_model.Subgraphs(0).OperatorsLength(), 3)
+        self.assertEqual(tfl_model.Subgraphs(0).Operators(0).OutputsLength(), 1)
+
+    def test_consecutive_gather(self):
+        class TestModel(nn.Module):
+            def forward(self, x):
+                x = x.relu()
+                x = x[..., [2, 1, 0]]
+                x = x[..., [2, 1, 0]]
+                return x
+
+        model = TestModel()
+        model.eval()
+
+        dummy_input = torch.randn(1, 2, 3)
+        model_path = get_model_path()
+
+        converter = TFLiteConverter(model, dummy_input, model_path, nchw_transpose=False)
+        converter.convert()
+
+        tfl_model = parse_model(model_path)
+        self.assertEqual(tfl_model.OperatorCodesLength(), 1)
+        self.assertEqual(tfl_model.OperatorCodes(0).DeprecatedBuiltinCode(), tflite.BuiltinOperator.RELU)
+        self.assertEqual(tfl_model.SubgraphsLength(), 1)
+        self.assertEqual(tfl_model.Subgraphs(0).InputsLength(), 1)
+        self.assertEqual(tfl_model.Subgraphs(0).OutputsLength(), 1)
+        self.assertEqual(tfl_model.Subgraphs(0).OperatorsLength(), 1)
         self.assertEqual(tfl_model.Subgraphs(0).Operators(0).OutputsLength(), 1)
 
 

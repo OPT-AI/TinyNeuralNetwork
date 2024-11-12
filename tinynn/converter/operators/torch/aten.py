@@ -13,6 +13,15 @@ from .. import tflite as tfl
 log = get_logger(__name__, 'INFO')
 
 
+class AtenSignOperator(ATenSignSchema):
+    def parse(self, node, attrs, args, graph_converter):
+
+        super().parse(node, attrs, args, graph_converter)
+
+        self.run(node)
+        self.elementwise_unary(tfl.SignOperator, graph_converter)
+
+
 class ATenLstmOperator(ATenLstmSchema):
     def lstm_input_helper(
         self, input_tensors, params_tensors, has_biases, param_start_index, input_start_index, layer_idx, suffix
@@ -265,7 +274,7 @@ class ATenLstmOperator(ATenLstmSchema):
 
                         if not self.separated_rnn_gate_calc:
                             gate_outs = [self.create_transform_tensor(t) for t in np.split(add_out.tensor, 4, 1)]
-                            split_dim_tensor = self.create_attr_tensor(np.array([1], dtype='int32'))
+                            split_dim_tensor = self.create_attr_tensor(np.array(1, dtype='int32'))
                             ops.append(tfl.SplitOperator([split_dim_tensor, add_out], gate_outs, 4))
 
                         gate_i = self.create_transform_tensor(
@@ -421,6 +430,7 @@ class ATenLstmOperator(ATenLstmSchema):
                     pack_op.extra_hints['warn_on_unused'] = False
                     ops.append(pack_op)
         else:
+            ops[-1].extra_hints['cell_output'] = self.output_names[-1]
             common_names = set(self.output_names[1:]) & set(graph_converter.outputs)
             assert len(common_names) == 0, (
                 f"Please remove the LSTM state outputs ({common_names}) from the model. Alternatively, you can try"
@@ -545,7 +555,6 @@ class ATenGruOperator(ATenGruSchema):
     ):
         assert is_train in (False, 0)
         self.unroll_rnn = True
-        self.separated_rnn_gate_calc = True
 
         expected_num_params = 2 * num_layers
         params_step = 2
@@ -676,73 +685,159 @@ class ATenGruOperator(ATenGruSchema):
                     for i, t in enumerate(input_ts[::stride]):
 
                         input_mm_list = []
-                        for j, (w_i, b_i) in enumerate(zip(w_i_list, b_i_list)):
+
+                        if not self.separated_rnn_gate_calc:
+
+                            wir, wiz, win = w_i_list
+                            whr, whz, whn = w_r_list
+                            bir, biz, bin = b_i_list
+                            bhr, bhz, bhn = b_r_list
+
+                            w_i = self.create_attr_tensor(np.concatenate([wir.tensor, wiz.tensor, win.tensor], 0))
+                            w_h = self.create_attr_tensor(np.concatenate([whr.tensor, whz.tensor, whn.tensor], 0))
+                            b_i = self.create_attr_tensor(np.concatenate([bir.tensor, biz.tensor, bin.tensor], 0))
+                            b_h = self.create_attr_tensor(np.concatenate([bhr.tensor, bhz.tensor, bhn.tensor], 0))
 
                             input_mm = self.create_transform_tensor(
                                 np.matmul(t.tensor, np.transpose(w_i.tensor, [1, 0])) + b_i.tensor
                             )
+                            hidden_mm = self.create_transform_tensor(
+                                np.matmul(h.tensor, np.transpose(w_h.tensor, [1, 0])) + b_h.tensor
+                            )
+
                             ops.append(tfl.FullyConnectedOperator([t, w_i, b_i], [input_mm]))
-                            input_mm_list.append(input_mm)
+                            ops.append(tfl.FullyConnectedOperator([h, w_h, b_h], [hidden_mm]))
 
-                        if i != 0 or compute_h:
+                            left_in = np.split(input_mm.tensor, 3, axis=1)
+                            dim_tensor = self.create_attr_tensor(np.array(1, dtype='int32'))
+                            splited_left_in = [self.create_transform_tensor(t) for t in left_in]
 
-                            hidden_mm_list = []
-                            for j, (w_r, b_r) in enumerate(zip(w_r_list, b_r_list)):
+                            ops.append(tfl.SplitOperator([dim_tensor, input_mm], splited_left_in, 3))
 
-                                hidden_mm = self.create_transform_tensor(
-                                    np.matmul(h.tensor, np.transpose(w_r.tensor, [1, 0])) + b_r.tensor
-                                )
-                                ops.append(tfl.FullyConnectedOperator([h, w_r, b_r], [hidden_mm]))
-                                hidden_mm_list.append(hidden_mm)
+                            right_in = np.split(hidden_mm.tensor, 3, axis=-1)
+                            splited_right_in = [self.create_transform_tensor(t) for t in right_in]
+
+                            ops.append(tfl.SplitOperator([dim_tensor, hidden_mm], splited_right_in, 3))
+
+                            rgate_left_in, zgate_left_in, ngate_left_in = splited_left_in
+                            rgate_right_in, zgate_right_in, ngate_right_in_b = splited_right_in
+
+                            rgate_in = self.create_transform_tensor(rgate_left_in.tensor + rgate_right_in.tensor)
+                            ops.append(tfl.AddOperator([rgate_left_in, rgate_right_in], [rgate_in]))
+
+                            rgate_out = self.create_transform_tensor(
+                                torch.sigmoid(torch.from_numpy(rgate_in.tensor)).numpy()
+                            )
+                            ops.append(tfl.LogisticOperator([rgate_in], [rgate_out]))
+
+                            zgate_in = self.create_transform_tensor(zgate_left_in.tensor + zgate_right_in.tensor)
+                            ops.append(tfl.AddOperator([zgate_left_in, zgate_right_in], [zgate_in]))
+
+                            zgate_out = self.create_transform_tensor(
+                                torch.sigmoid(torch.from_numpy(zgate_in.tensor)).numpy()
+                            )
+                            ops.append(tfl.LogisticOperator([zgate_in], [zgate_out]))
+
+                            ngate_right_in = self.create_transform_tensor(rgate_out.tensor * ngate_right_in_b.tensor)
+                            ops.append(tfl.MulOperator([rgate_out, ngate_right_in_b], [ngate_right_in]))
+
+                            ngate_in = self.create_transform_tensor(ngate_left_in.tensor + ngate_right_in.tensor)
+                            ops.append(tfl.AddOperator([ngate_left_in, ngate_right_in], [ngate_in]))
+
+                            ngate_out = self.create_transform_tensor(
+                                torch.tanh(torch.from_numpy(ngate_in.tensor)).numpy()
+                            )
+                            ops.append(tfl.TanhOperator([ngate_in], [ngate_out]))
+
+                            constant_tensor = self.create_attr_tensor(torch.tensor(1, dtype=torch.float32))
+
+                            h_left_0 = self.create_transform_tensor(constant_tensor.tensor - zgate_out.tensor)
+                            ops.append(tfl.SubOperator([constant_tensor, zgate_out], [h_left_0]))
+
+                            h_left = self.create_transform_tensor(h_left_0.tensor * ngate_out.tensor)
+                            ops.append(tfl.MulOperator([h_left_0, ngate_out], [h_left]))
+
+                            if i != 0 or compute_h:
+                                h_right = self.create_transform_tensor(zgate_out.tensor * h.tensor)
+                                ops.append(tfl.MulOperator([zgate_out, h], [h_right]))
+
+                                h = self.create_transform_tensor(h_left.tensor + h_right.tensor)
+                                ops.append(tfl.AddOperator([h_left, h_right], [h]))
+
+                            elif i == 0 and not compute_h:
+                                h = h_left
+
+                            stacked_hs.append(h)
+
                         else:
-                            hidden_mm_list = b_r_list
+                            for j, (w_i, b_i) in enumerate(zip(w_i_list, b_i_list)):
 
-                        # calculate r,z,n gates
-                        rgate_in = self.create_transform_tensor(input_mm_list[0].tensor + hidden_mm_list[0].tensor)
-                        ops.append(tfl.AddOperator([input_mm_list[0], hidden_mm_list[0]], [rgate_in]))
+                                input_mm = self.create_transform_tensor(
+                                    np.matmul(t.tensor, np.transpose(w_i.tensor, [1, 0])) + b_i.tensor
+                                )
+                                ops.append(tfl.FullyConnectedOperator([t, w_i, b_i], [input_mm]))
+                                input_mm_list.append(input_mm)
 
-                        zgate_in = self.create_transform_tensor(input_mm_list[1].tensor + hidden_mm_list[1].tensor)
-                        ops.append(tfl.AddOperator([input_mm_list[1], hidden_mm_list[1]], [zgate_in]))
+                            if i != 0 or compute_h:
 
-                        zgate_out = self.create_transform_tensor(
-                            torch.sigmoid(torch.from_numpy(zgate_in.tensor)).numpy()
-                        )
+                                hidden_mm_list = []
+                                for j, (w_r, b_r) in enumerate(zip(w_r_list, b_r_list)):
 
-                        ops.append(tfl.LogisticOperator([zgate_in], [zgate_out]))
+                                    hidden_mm = self.create_transform_tensor(
+                                        np.matmul(h.tensor, np.transpose(w_r.tensor, [1, 0])) + b_r.tensor
+                                    )
+                                    ops.append(tfl.FullyConnectedOperator([h, w_r, b_r], [hidden_mm]))
+                                    hidden_mm_list.append(hidden_mm)
+                            else:
+                                hidden_mm_list = b_r_list
 
-                        rgate_out = self.create_transform_tensor(
-                            torch.sigmoid(torch.from_numpy(rgate_in.tensor)).numpy()
-                        )
-                        ops.append(tfl.LogisticOperator([rgate_in], [rgate_out]))
+                            # calculate r,z,n gates
+                            rgate_in = self.create_transform_tensor(input_mm_list[0].tensor + hidden_mm_list[0].tensor)
+                            ops.append(tfl.AddOperator([input_mm_list[0], hidden_mm_list[0]], [rgate_in]))
 
-                        ngate_in_hside = self.create_transform_tensor(rgate_out.tensor * hidden_mm_list[2].tensor)
-                        ops.append(tfl.MulOperator([rgate_out, hidden_mm_list[2]], [ngate_in_hside]))
+                            zgate_in = self.create_transform_tensor(input_mm_list[1].tensor + hidden_mm_list[1].tensor)
+                            ops.append(tfl.AddOperator([input_mm_list[1], hidden_mm_list[1]], [zgate_in]))
 
-                        ngate_in = self.create_transform_tensor(input_mm_list[2].tensor + ngate_in_hside.tensor)
-                        ops.append(tfl.AddOperator([input_mm_list[2], ngate_in_hside], [ngate_in]))
+                            zgate_out = self.create_transform_tensor(
+                                torch.sigmoid(torch.from_numpy(zgate_in.tensor)).numpy()
+                            )
+                            ops.append(tfl.LogisticOperator([zgate_in], [zgate_out]))
 
-                        ngate_out = self.create_transform_tensor(torch.tanh(torch.from_numpy(ngate_in.tensor)).numpy())
-                        ops.append(tfl.TanhOperator([ngate_in], [ngate_out]))
+                            rgate_out = self.create_transform_tensor(
+                                torch.sigmoid(torch.from_numpy(rgate_in.tensor)).numpy()
+                            )
+                            ops.append(tfl.LogisticOperator([rgate_in], [rgate_out]))
 
-                        constant_tensor = self.create_attr_tensor(torch.tensor(1, dtype=torch.float32))
+                            ngate_in_hside = self.create_transform_tensor(rgate_out.tensor * hidden_mm_list[2].tensor)
+                            ops.append(tfl.MulOperator([rgate_out, hidden_mm_list[2]], [ngate_in_hside]))
 
-                        h_left_0 = self.create_transform_tensor(constant_tensor.tensor - zgate_out.tensor)
-                        ops.append(tfl.SubOperator([constant_tensor, zgate_out], [h_left_0]))
+                            ngate_in = self.create_transform_tensor(input_mm_list[2].tensor + ngate_in_hside.tensor)
+                            ops.append(tfl.AddOperator([input_mm_list[2], ngate_in_hside], [ngate_in]))
 
-                        h_left = self.create_transform_tensor(h_left_0.tensor * ngate_out.tensor)
-                        ops.append(tfl.MulOperator([h_left_0, ngate_out], [h_left]))
+                            ngate_out = self.create_transform_tensor(
+                                torch.tanh(torch.from_numpy(ngate_in.tensor)).numpy()
+                            )
+                            ops.append(tfl.TanhOperator([ngate_in], [ngate_out]))
 
-                        if i != 0 or compute_h:
-                            h_right = self.create_transform_tensor(zgate_out.tensor * h.tensor)
-                            ops.append(tfl.MulOperator([zgate_out, h], [h_right]))
+                            constant_tensor = self.create_attr_tensor(torch.tensor(1, dtype=torch.float32))
 
-                            h = self.create_transform_tensor(h_left.tensor + h_right.tensor)
-                            ops.append(tfl.AddOperator([h_left, h_right], [h]))
+                            h_left_0 = self.create_transform_tensor(constant_tensor.tensor - zgate_out.tensor)
+                            ops.append(tfl.SubOperator([constant_tensor, zgate_out], [h_left_0]))
 
-                        elif i == 0 and not compute_h:
-                            h = h_left
+                            h_left = self.create_transform_tensor(h_left_0.tensor * ngate_out.tensor)
+                            ops.append(tfl.MulOperator([h_left_0, ngate_out], [h_left]))
 
-                        stacked_hs.append(h)
+                            if i != 0 or compute_h:
+                                h_right = self.create_transform_tensor(zgate_out.tensor * h.tensor)
+                                ops.append(tfl.MulOperator([zgate_out, h], [h_right]))
+
+                                h = self.create_transform_tensor(h_left.tensor + h_right.tensor)
+                                ops.append(tfl.AddOperator([h_left, h_right], [h]))
+
+                            elif i == 0 and not compute_h:
+                                h = h_left
+
+                            stacked_hs.append(h)
 
                     tf_out_state_tensors[0].append(h)
                     output_ts.extend(stacked_hs[::stride])
@@ -1118,7 +1213,7 @@ class ATenSubOperator(ATenSubSchema):
 
         if type(other) in (int, float, bool):
             self.input_tensors[1] = torch.tensor([other], dtype=self.input_tensors[0].dtype)
-        elif type(other) != torch.Tensor:
+        elif not isinstance(other, torch.Tensor):
             assert False, "other should have type int, float, tensor in aten::sub(input, other)"
 
         self.elementwise_binary(tfl.SubOperator, graph_converter, True)
@@ -1136,7 +1231,7 @@ class ATenRsubOperator(ATenRsubSchema):
 
         if type(other) in (int, float, bool):
             self.input_tensors[1] = torch.tensor([other], dtype=self.input_tensors[0].dtype)
-        elif type(other) != torch.Tensor:
+        elif not isinstance(other, torch.Tensor):
             assert False, "other should have type int, float, tensor in aten::rsub(input, other)"
 
         # Swap the first two input tensors and their names
@@ -1174,7 +1269,7 @@ class ATenMulOperator(ATenMulSchema):
 
         if type(other) in (int, float):
             self.input_tensors[1] = torch.tensor([other], dtype=self.input_tensors[0].dtype)
-        elif type(other) != torch.Tensor:
+        elif not isinstance(other, torch.Tensor):
             assert False, "other should have type int, float, tensor in aten::mul(input, other)"
 
         self.elementwise_binary(tfl.MulOperator, graph_converter, True)
@@ -1244,7 +1339,7 @@ class ATenDivOperator(ATenDivSchema):
         other = self.input_tensors[1]
         if type(other) in (int, float):
             self.input_tensors[1] = torch.tensor([other], dtype=self.input_tensors[0].dtype)
-        elif type(other) != torch.Tensor:
+        elif not isinstance(other, torch.Tensor):
             assert False, "other should have type int, float, tensor in aten::div(input, other)"
 
         self.elementwise_binary(tfl.DivOperator, graph_converter, True)
@@ -1268,7 +1363,7 @@ class ATenPowOperator(ATenPowSchema):
             torch.int32,
         ), "Input should be tensors of type torch.float32 or torch.int32"
 
-        if type(self.input_tensors[1]) != torch.Tensor:
+        if not isinstance(self.input_tensors[1], torch.Tensor):
             self.input_tensors[1] = torch.tensor([self.input_tensors[1]], dtype=self.input_tensors[0].dtype)
 
         self.elementwise_binary(tfl.PowOperator, graph_converter, True)
@@ -1466,7 +1561,7 @@ class ATenStackOperator(ATenStackSchema):
         self.run(node)
 
         dim = self.input_tensors[1]
-        assert type(dim) == int
+        assert type(dim) is int
 
         if dim < 0:
             dim += self.input_tensors[0][0].ndim + 1
@@ -1524,7 +1619,7 @@ class ATenCatOperator(ATenCatSchema):
         self.run(node)
 
         dim = self.input_tensors[1]
-        assert type(dim) == int
+        assert type(dim) is int
 
         if dim < 0:
             dim += self.input_tensors[0][0].ndim
@@ -1553,7 +1648,7 @@ class ATenPreluOperator(ATenPreluSchema):
         alpha_tensor = self.find_or_create_input(1, graph_converter)
         shape_tensor = self.create_attr_tensor(np.array(new_shape, dtype='int32'))
 
-        update_name = True
+        update_name = None
         if weight_c == input_c:
             new_alpha = self.create_transform_tensor(np.reshape(alpha_tensor.tensor, new_shape))
             graph_converter.add_operator(tfl.ReshapeOperator([alpha_tensor, shape_tensor], [new_alpha], new_shape))
@@ -1562,12 +1657,19 @@ class ATenPreluOperator(ATenPreluSchema):
             if alpha_tensor.buffer is None:
                 graph_converter.add_operator(tfl.TileOperator([alpha_tensor, shape_tensor], [new_alpha]))
             else:
-                update_name = False
-                new_alpha = new_alpha.tensor
+                store = graph_converter.get_transform_store(alpha_tensor.name, str(input_c))
+                if store is None:
+                    graph_converter.add_transform_store(alpha_tensor.name, str(input_c), new_alpha.name)
+                    update_name = new_alpha.name
+                    new_alpha = new_alpha.tensor
+                else:
+                    update_name = store
 
         self.input_tensors[1] = new_alpha
-        if update_name:
+        if update_name is None:
             self.input_names[1] = new_alpha.name
+        else:
+            self.input_names[1] = update_name
 
         self.elementwise_binary(tfl.PreluOperator, graph_converter, False)
 
@@ -1637,7 +1739,7 @@ class ATenFloorDivideOperator(ATenFloorDivideSchema):
         super().parse(node, attrs, args, graph_converter)
 
         self.run(node)
-        if type(self.input_tensors[1]) != torch.Tensor:
+        if not isinstance(self.input_tensors[1], torch.Tensor):
             self.input_tensors[1] = torch.tensor([self.input_tensors[1]], dtype=self.input_tensors[0].dtype)
         elif self.input_tensors[1].dtype != self.input_tensors[0].dtype:
             other = self.find_or_create_input(1, graph_converter)
@@ -1713,6 +1815,9 @@ class ATenConvolutionOperator(ATenConvolutionSchema):
         inputs = [self.find_or_create_input(i, graph_converter) for i in range(end_index)]
         outputs = self.to_tfl_tensors(self.output_names, self.output_tensors)
 
+        if len(stride) != len(padding) and len(stride) == 1:
+            stride = stride * len(padding)
+
         if transpose == 0:
             graph_converter.add_operator(
                 tfl.GenericConvOperator(inputs, outputs, stride, padding, dilation, output_padding, groups)
@@ -1765,17 +1870,84 @@ class ATenSliceOperator(ATenSliceSchema):
         starts = np.zeros(input_tensor.tensor.ndim, dtype='int32')
         starts[dim] = start
 
-        start_tensor = self.create_attr_tensor(starts)
+        if self.input_names[2] in graph_converter.constant_mapping:
+            start_t = graph_converter.constant_mapping[self.input_names[2]]
+            new_shape_arr = np.array((1,), dtype='int32')
+            new_shape_tensor = self.create_attr_tensor(new_shape_arr)
+            start_reshaped = self.create_transform_tensor(np.reshape(start_t.tensor, new_shape_arr))
+            graph_converter.add_operator(
+                tfl.ReshapeOperator([start_t, new_shape_tensor], [start_reshaped], new_shape_arr)
+            )
 
-        if step != 1:
-            # if True:
-            ends = np.array(input_tensor.tensor.shape, dtype='int32')
+            start_casted = self.create_transform_tensor(start_reshaped.tensor.astype('int32'))
+            graph_converter.add_operator(
+                tfl.CastOperator(
+                    [start_reshaped],
+                    [start_casted],
+                    tfl.numpy_tflite_dtype_mappings[str(start_reshaped.dtype)],
+                    tfl.numpy_tflite_dtype_mappings[str(start_casted.dtype)],
+                )
+            )
+
+            start_tensor = self.create_transform_tensor(starts)
+            starts_left = starts[:dim]
+            starts_right = starts[dim + 1 :]
+            starts_tensors = []
+            if len(starts_left) > 0:
+                starts_tensors.append(self.create_attr_tensor(starts_left))
+            starts_tensors.append(start_casted)
+            if len(starts_right) > 0:
+                starts_tensors.append(self.create_attr_tensor(starts_right))
+            if len(starts_tensors) > 1:
+                graph_converter.add_operator(tfl.ConcatenationOperator(starts_tensors, [start_tensor], 0))
+            else:
+                start_tensor = starts_tensors[0]
+        else:
+            start_tensor = self.create_attr_tensor(starts)
+
+        ends = np.array(input_tensor.tensor.shape, dtype='int32')
+        if step != 1 or start_tensor.buffer is None or self.input_names[3] in graph_converter.constant_mapping:
             ends[dim] = end
+        else:
+            ends[dim] = end - start
 
+        if self.input_names[3] in graph_converter.constant_mapping:
+            end_t = graph_converter.constant_mapping[self.input_names[3]]
+            new_shape_arr = np.array((1,), dtype='int32')
+            new_shape_tensor = self.create_attr_tensor(new_shape_arr)
+            end_reshaped = self.create_transform_tensor(np.reshape(end_t.tensor, new_shape_arr))
+            graph_converter.add_operator(tfl.ReshapeOperator([end_t, new_shape_tensor], [end_reshaped], new_shape_arr))
+
+            end_casted = self.create_transform_tensor(end_reshaped.tensor.astype('int32'))
+            graph_converter.add_operator(
+                tfl.CastOperator(
+                    [end_reshaped],
+                    [end_casted],
+                    tfl.numpy_tflite_dtype_mappings[str(end_reshaped.dtype)],
+                    tfl.numpy_tflite_dtype_mappings[str(end_casted.dtype)],
+                )
+            )
+
+            end_tensor = self.create_transform_tensor(ends)
+            ends_left = ends[:dim]
+            ends_right = ends[dim + 1 :]
+            ends_tensors = []
+            if len(ends_left) > 0:
+                ends_tensors.append(self.create_attr_tensor(ends_left))
+            ends_tensors.append(end_casted)
+            if len(ends_right) > 0:
+                ends_tensors.append(self.create_attr_tensor(ends_right))
+            if len(ends_tensors) > 1:
+                graph_converter.add_operator(tfl.ConcatenationOperator(ends_tensors, [end_tensor], 0))
+            else:
+                end_tensor = ends_tensors[0]
+        else:
+            end_tensor = self.create_attr_tensor(ends)
+
+        if step != 1 or start_tensor.buffer is None or end_tensor.buffer is None:
             strides = np.ones(input_tensor.tensor.ndim, dtype='int32')
             strides[dim] = step
 
-            end_tensor = self.create_attr_tensor(ends)
             stride_tensor = self.create_attr_tensor(strides)
 
             inputs = [input_tensor, start_tensor, end_tensor, stride_tensor]
@@ -1783,10 +1955,7 @@ class ATenSliceOperator(ATenSliceSchema):
 
             graph_converter.add_operator(tfl.StridedSliceOperator(inputs, outputs))
         else:
-            sizes = np.array(input_tensor.tensor.shape, dtype='int32')
-            sizes[dim] = end - start
-
-            size_tensor = self.create_attr_tensor(sizes)
+            size_tensor = end_tensor
             inputs = [input_tensor, start_tensor, size_tensor]
             outputs = self.to_tfl_tensors(self.output_names, self.output_tensors)
 
@@ -1860,7 +2029,7 @@ class ATenAddOperator(ATenAddSchema):
 
         if type(other) in (int, float, bool):
             self.input_tensors[1] = torch.tensor([other], dtype=self.input_tensors[0].dtype)
-        elif type(other) != torch.Tensor:
+        elif not isinstance(other, torch.Tensor):
             assert False, "other should have type int, float, tensor in aten::add(input, other)"
 
         self.elementwise_binary(tfl.AddOperator, graph_converter, True)
@@ -1898,8 +2067,8 @@ class ATenSelectOperator(ATenSelectSchema):
         input_tensor = self.find_or_create_input(0, graph_converter)
         dim, index = self.input_tensors[1:]
 
-        assert type(dim) == int
-        assert type(index) == int
+        assert type(dim) is int
+        assert type(index) is int
 
         if dim < 0:
             dim += input_tensor.tensor.ndim
@@ -1997,11 +2166,11 @@ class ATenClampOperator(ATenClampSchema):
         self.parse_common(node, attrs, args, graph_converter)
 
     def parse_common(self, node, attrs, args, graph_converter):
-        if type(self) == ATenClampOperator:
+        if type(self) is ATenClampOperator:
             min_value, max_value = self.input_tensors[1:]
-        elif type(self) == ATenClampMinOperator:
+        elif type(self) is ATenClampMinOperator:
             min_value, max_value = self.input_tensors[1], None
-        elif type(self) == ATenClampMaxOperator:
+        elif type(self) is ATenClampMaxOperator:
             min_value, max_value = None, self.input_tensors[1]
 
         has_min = min_value is not None
@@ -2101,7 +2270,7 @@ class ATenNeOperator(ATenNeSchema):
         super().parse(node, attrs, args, graph_converter)
 
         self.run(node)
-        if type(self.input_tensors[1]) != torch.Tensor:
+        if not isinstance(self.input_tensors[1], torch.Tensor):
             self.input_tensors[1] = self.torch_tensor_from_scalar(self.input_tensors[0], self.input_tensors[1])
 
         self.elementwise_binary(tfl.NotEqualOperator, graph_converter, True)
@@ -2116,7 +2285,7 @@ class ATenSoftplusOperator(ATenSoftplusSchema):
         beta = self.input_tensors[1]
 
         assert beta == 1.0, "Only beta=1.0 is supported for aten::softplus"
-        warnings.warn('threshold is ignored when transforiming aten::softplus')
+        warnings.warn('threshold is ignored when transforming aten::softplus')
 
         ops = []
 
@@ -2290,7 +2459,7 @@ class ATenGroupNormOperator(ATenGroupNormSchema):
         else:
             axis = tuple(range(1, dims))
             axis_tensor = self.create_attr_tensor(np.array(axis, dtype='int32'))
-            split_dim_tensor = self.create_attr_tensor(np.array([1], dtype='int32'))
+            split_dim_tensor = self.create_attr_tensor(np.array(1, dtype='int32'))
             inputs = [self.create_transform_tensor(t) for t in np.split(inp.tensor, n_groups, axis=1)]
             ops.append(tfl.SplitOperator([split_dim_tensor, inp], inputs, n_groups))
 
@@ -2357,38 +2526,114 @@ class ATenIndexOperator(ATenIndexSchema):
 
         filtered_dims = [i for i, idx in enumerate(indices) if idx is not None]
         assert all((indices[i].dtype in (torch.int64, torch.int32) for i in filtered_dims))
-        assert len(filtered_dims) == 1, "Multiple indices for aten::index is not supported"
-
-        try:
-            names = graph_converter.get_list_expanded_names(self.input_names[1])
-        except KeyError:
-            names = [self.get_unique_attr_name() for _ in indices]
-
-        filtered_names = [names[i] for i in filtered_dims]
-        filtered_tensors = [indices[i].to(dtype=torch.int32) for i in filtered_dims]
 
         input_tensor = self.find_or_create_input(0, graph_converter)
-        # TODO: support negative tensor indices
-        filtered_tensors = [
-            t + (t < 0).int() * input_tensor.shape[i] if n not in graph_converter.tensor_map else t
-            for i, n, t in zip(filtered_dims, filtered_names, filtered_tensors)
-        ]
-        indice_tensors = self.to_tfl_tensors(
-            filtered_names, filtered_tensors, graph_converter=graph_converter, non_existent_as_buffer=True
-        )
         outputs = self.to_tfl_tensors(self.output_names, self.output_tensors)
 
-        actual_input = input_tensor
-        actual_output = None
-        for i, (dim, idx) in enumerate(zip(filtered_dims, indice_tensors)):
-            if i == len(filtered_dims) - 1:
-                actual_output = outputs[0]
+        if len(filtered_dims) > 1:
+            if graph_converter.has_nested_names(self.input_names[1]):
+                input_names = graph_converter.get_list_expanded_names(self.input_names[1])
+                indices_tensors = self.to_tfl_tensors(
+                    input_names, self.input_tensors[1], graph_converter=graph_converter, non_existent_as_buffer=True
+                )
             else:
-                actual_output = self.create_transform_tensor(np.take(actual_input.tensor, idx.tensor, axis=dim))
+                if type(self.input_tensors[1]) in (tuple, list):
+                    indices_tensors = [self.create_attr_tensor(x) for x in self.input_tensors[1]]
+                else:
+                    indices_tensors = [self.find_or_create_input(1, graph_converter)]
 
-            graph_converter.add_operator(tfl.GatherOperator([actual_input, idx], [actual_output], axis=dim))
+            dim = input_tensor.tensor.ndim
 
-            actual_input = actual_output
+            indices_shape = [x.tensor.size for x in indices_tensors]
+            max_len = max(indices_shape)
+            indices_shape_tensor = torch.tensor(indices_shape)
+            left_indices = (
+                torch.arange(max_len).view(-1, 1).expand(-1, len(indices_shape)) % indices_shape_tensor
+            ).int()
+            all_indices_shape = list(outputs[0].shape) + [dim]
+
+            if len(indices_tensors) < dim:
+                pad_shape = list(input_tensor.shape[len(indices_tensors) :])
+                pad_indices = torch.ones(pad_shape).nonzero().int()
+                left_len = len(indices_shape)
+                right_len = len(pad_shape)
+                left_size = left_indices.size(0)
+                right_size = pad_indices.size(0)
+                left_reshaped = (
+                    left_indices.view(-1, 1, left_len).expand(-1, right_size, left_len).reshape(-1, left_len)
+                )
+                right_reshaped = (
+                    pad_indices.view(1, -1, right_len).expand(left_size, -1, right_len).reshape(-1, right_len)
+                )
+                all_indices = torch.cat([left_reshaped, right_reshaped], 1).view(all_indices_shape).unbind(-1)
+            else:
+                all_indices = left_indices.view(all_indices_shape).unbind(-1)
+
+            new_indices = []
+            for i in range(dim):
+                if i < len(indices_tensors):
+                    idx_tensor = indices_tensors[i]
+                    actual_idx = np.take(idx_tensor.tensor, all_indices[i].numpy())
+                else:
+                    actual_idx = all_indices[i].numpy()
+                if idx_tensor.buffer is None and i < len(indices_tensors):
+                    actual_idx_t = self.create_transform_tensor(actual_idx)
+                    fake_idx_t = self.create_attr_tensor(all_indices[i].numpy())
+                    graph_converter.add_operator(tfl.GatherOperator([idx_tensor, fake_idx_t], [actual_idx_t], axis=0))
+
+                    if str(actual_idx_t.dtype) != 'int32':
+                        index_casted = self.create_transform_tensor(actual_idx_t.tensor.astype('int32'))
+                        graph_converter.add_operator(
+                            tfl.CastOperator(
+                                [actual_idx_t],
+                                [index_casted],
+                                tfl.numpy_tflite_dtype_mappings[str(actual_idx_t.dtype)],
+                                tfl.numpy_tflite_dtype_mappings[str(index_casted.dtype)],
+                            )
+                        )
+                        actual_idx_t = index_casted
+                    new_indices.append(actual_idx_t)
+                else:
+                    new_indices.append(self.create_attr_tensor(actual_idx.astype(np.int32)))
+
+            index_arr = np.stack([x.tensor for x in new_indices], -1)
+            if all((x.buffer is not None for x in new_indices)):
+                index_tensor = self.create_attr_tensor(index_arr)
+            else:
+                index_tensor = self.create_transform_tensor(index_arr)
+                graph_converter.add_operator(
+                    tfl.PackOperator(new_indices, [index_tensor], dim, axis=index_tensor.tensor.ndim - 1)
+                )
+
+            graph_converter.add_operator(tfl.GatherNdOperator([input_tensor, index_tensor], outputs))
+        else:
+            try:
+                names = graph_converter.get_list_expanded_names(self.input_names[1])
+            except KeyError:
+                names = [self.get_unique_attr_name() for _ in indices]
+
+            filtered_names = [names[i] for i in filtered_dims]
+            filtered_tensors = [indices[i].to(dtype=torch.int32) for i in filtered_dims]
+
+            filtered_tensors = [
+                t + (t < 0).int() * input_tensor.shape[i] if n not in graph_converter.tensor_map else t
+                for i, n, t in zip(filtered_dims, filtered_names, filtered_tensors)
+            ]
+            indice_tensors = self.to_tfl_tensors(
+                filtered_names, filtered_tensors, graph_converter=graph_converter, non_existent_as_buffer=True
+            )
+
+            actual_input = input_tensor
+            actual_output = None
+            for i, (dim, idx) in enumerate(zip(filtered_dims, indice_tensors)):
+                if i == len(filtered_dims) - 1:
+                    actual_output = outputs[0]
+                else:
+                    actual_output = self.create_transform_tensor(np.take(actual_input.tensor, idx.tensor, axis=dim))
+
+                graph_converter.add_operator(tfl.GatherOperator([actual_input, idx], [actual_output], axis=dim))
+
+                actual_input = actual_output
 
 
 class ATenIndexSelectOperator(ATenIndexSelectSchema):
@@ -2474,6 +2719,67 @@ class ATenRepeatOperator(ATenRepeatSchema):
 
         for op in ops:
             graph_converter.add_operator(op)
+
+
+class ATenRepeatInterleaveOperator(ATenRepeatInterleaveSchema):
+    def parse(self, node, attrs, args, graph_converter):
+        super().parse(node, attrs, args, graph_converter)
+
+        self.run(node)
+
+        input_tensor = self.find_or_create_input(0, graph_converter)
+        outputs = self.to_tfl_tensors(self.output_names, self.output_tensors)
+
+        if 'dim' in args:
+            dim = self.input_tensors[args['dim']]
+        else:
+            dim = None
+
+        if 'repeats' in args:
+            repeats = self.input_tensors[args['repeats']]
+        else:
+            repeats = None
+
+        if repeats is None:
+            size_repeats = input_tensor.tensor.size
+            raw_indices = torch.arange(size_repeats, dtype=torch.int32)
+            repeats_tensor = input_tensor
+        elif type(repeats) is int:
+            if dim is None:
+                size_repeats = input_tensor.tensor.size
+            else:
+                size_repeats = input_tensor.shape[dim]
+            raw_indices = torch.arange(size_repeats, dtype=torch.int32)
+            repeats_arr = torch.tensor(repeats, dtype=torch.int32)
+            repeats_tensor = self.create_attr_tensor(repeats_arr)
+        else:
+            if dim is None:
+                size_repeats = input_tensor.tensor.size
+            else:
+                size_repeats = input_tensor.shape[dim]
+            raw_indices = torch.arange(size_repeats, dtype=torch.int32)
+            repeats_tensor = self.find_or_create_input(args['repeats'], graph_converter)
+
+        assert repeats_tensor.buffer is not None, "dynamic repeats_tensor is not supported"
+
+        actual_indices = self.create_attr_tensor(
+            torch.repeat_interleave(raw_indices, torch.from_numpy(repeats_tensor.tensor).long())
+        )
+
+        actual_input = input_tensor
+        if dim is None and len(input_tensor.shape) > 1:
+            new_shape = (input_tensor.tensor.size,)
+            shape_tensor = self.create_attr_tensor(np.array(new_shape, dtype='int32'))
+            actual_input = self.create_transform_tensor(np.reshape(input_tensor.tensor, new_shape))
+            graph_converter.add_operator(tfl.ReshapeOperator([input_tensor, shape_tensor], [actual_input], new_shape))
+
+        inputs = [actual_input, actual_indices]
+        gather_dim = dim
+        if gather_dim is None:
+            gather_dim = 0
+        if gather_dim < 0:
+            gather_dim += input_tensor.tensor.ndim
+        graph_converter.add_operator(tfl.GatherOperator(inputs, outputs, gather_dim))
 
 
 class ATenMmOperator(ATenMmSchema):
@@ -2676,7 +2982,7 @@ class ATenSplitOperator(ATenSplitSchema):
         if dim < 0:
             dim += len(self.input_tensors[0].shape)
 
-        dim_tensor = self.create_attr_tensor(np.array([dim], dtype='int32'))
+        dim_tensor = self.create_attr_tensor(np.array(dim, dtype='int32'))
         size_splits = np.array([t.size(dim) for t in self.output_tensors[0]], dtype='int32')
         chunks = len(size_splits)
         split_tensor = self.create_attr_tensor(size_splits)
@@ -2718,7 +3024,7 @@ class ATenChunkOperator(ATenChunkSchema):
             chunks = dim_size
 
         input_tensor = self.find_or_create_input(0, graph_converter)
-        dim_tensor = self.create_attr_tensor(np.array([dim], dtype='int32'))
+        dim_tensor = self.create_attr_tensor(np.array(dim, dtype='int32'))
 
         output_names = [f'{self.output_names[0]}:{i}' for i in range(len(self.output_tensors[0]))]
         graph_converter.add_iterable_pair(self.output_names, output_names, 'input')
@@ -3038,6 +3344,142 @@ class ATenScatterOperator(ATenScatterSchema):
         )
 
 
+class ATenIndexPutOperator(ATenIndexPutSchema):
+    def parse(self, node, attrs, args, graph_converter):
+        super().parse(node, attrs, args, graph_converter)
+
+        # torch.Tensor.index_put_ requires index tensor of type `torch.int64`
+        accumulate = self.input_tensors[3]
+        assert not accumulate, "aten::index_put_ with accumulate=True is not supported"
+
+        orig_type = self.input_tensors[1][0].dtype
+        self.input_tensors[1] = tuple([x.to(dtype=torch.int64) for x in self.input_tensors[1]])
+        self.run(node)
+
+        input_tensor = self.find_or_create_input(0, graph_converter)
+        output_tensor = self.to_tfl_tensors(self.output_names, self.output_tensors)[0]
+
+        self.input_tensors[1] = tuple([x.to(dtype=orig_type) for x in self.input_tensors[1]])
+
+        if graph_converter.has_nested_names(self.input_names[1]):
+            input_names = graph_converter.get_list_expanded_names(self.input_names[1])
+            indices_tensors = self.to_tfl_tensors(
+                input_names, self.input_tensors[1], graph_converter=graph_converter, non_existent_as_buffer=True
+            )
+        else:
+            if type(self.input_tensors[1]) in (tuple, list):
+                indices_tensors = [self.create_attr_tensor(x) for x in self.input_tensors[1]]
+            else:
+                indices_tensors = [self.find_or_create_input(1, graph_converter)]
+
+        dim = input_tensor.tensor.ndim
+
+        indices_shape = [x.tensor.size for x in indices_tensors]
+        max_len = max(indices_shape)
+        indices_shape_tensor = torch.tensor(indices_shape)
+        left_indices = (torch.arange(max_len).view(-1, 1).expand(-1, len(indices_shape)) % indices_shape_tensor).int()
+
+        if len(indices_tensors) < dim:
+            pad_shape = list(input_tensor.shape[len(indices_tensors) :])
+            pad_indices = torch.ones(pad_shape).nonzero().int()
+            left_len = len(indices_shape)
+            right_len = len(pad_shape)
+            left_size = left_indices.size(0)
+            right_size = pad_indices.size(0)
+            left_reshaped = left_indices.view(-1, 1, left_len).expand(-1, right_size, left_len).reshape(-1, left_len)
+            right_reshaped = pad_indices.view(1, -1, right_len).expand(left_size, -1, right_len).reshape(-1, right_len)
+            all_indices = torch.cat([left_reshaped, right_reshaped], 1).unbind(1)
+        else:
+            all_indices = left_indices.unbind(1)
+
+        new_indices = []
+        for i in range(dim):
+            if i < len(indices_tensors):
+                idx_tensor = indices_tensors[i]
+                actual_idx = np.take(idx_tensor.tensor, all_indices[i].numpy())
+            else:
+                actual_idx = all_indices[i].numpy()
+            if idx_tensor.buffer is None and i < len(indices_tensors):
+                actual_idx_t = self.create_transform_tensor(actual_idx)
+                fake_idx_t = self.create_attr_tensor(all_indices[i].numpy())
+                graph_converter.add_operator(tfl.GatherOperator([idx_tensor, fake_idx_t], [actual_idx_t], axis=0))
+
+                if str(actual_idx_t.dtype) != 'int32':
+                    index_casted = self.create_transform_tensor(actual_idx_t.tensor.astype('int32'))
+                    graph_converter.add_operator(
+                        tfl.CastOperator(
+                            [actual_idx_t],
+                            [index_casted],
+                            tfl.numpy_tflite_dtype_mappings[str(actual_idx_t.dtype)],
+                            tfl.numpy_tflite_dtype_mappings[str(index_casted.dtype)],
+                        )
+                    )
+                    actual_idx_t = index_casted
+                new_indices.append(actual_idx_t)
+            else:
+                new_indices.append(self.create_attr_tensor(actual_idx.astype(np.int32)))
+
+        index_arr = np.stack([x.tensor for x in new_indices], 1)
+        if all((x.buffer is not None for x in new_indices)):
+            index_tensor = self.create_attr_tensor(index_arr)
+        else:
+            index_tensor = self.create_transform_tensor(index_arr)
+            graph_converter.add_operator(tfl.PackOperator(new_indices, [index_tensor], dim, axis=1))
+
+        val_tensor = self.find_or_create_input(2, graph_converter)
+        actual_val = val_tensor
+        orig_val_shape = val_tensor.shape
+        target_val_shape = index_tensor.shape[:-1]
+        if orig_val_shape != target_val_shape:
+            if val_tensor.buffer is None:
+                new_shape = orig_val_shape
+                val_reshaped = val_tensor
+                if len(target_val_shape) > len(orig_val_shape):
+                    new_shape = [1] * (len(target_val_shape) - len(orig_val_shape)) + list(orig_val_shape)
+                    new_shape_arr = np.array(new_shape, dtype='int32')
+                    new_shape_tensor = self.create_attr_tensor(new_shape_arr)
+                    reshaped = self.create_transform_tensor(np.reshape(val_tensor.tensor, new_shape_arr))
+                    val_reshaped = reshaped
+                    reshape_op = tfl.ReshapeOperator([val_tensor, new_shape_tensor], [reshaped], new_shape_arr)
+                    reshape_op.extra_hints['direction'] = 'up'
+                    graph_converter.add_operator(reshape_op)
+
+                repeats = []
+                for x, y in zip(new_shape, target_val_shape):
+                    if x != y:
+                        repeats.append(y // x)
+                    else:
+                        repeats.append(1)
+
+                actual_val = self.create_transform_tensor(np.tile(val_reshaped.tensor, repeats))
+                repeat_tensor = self.create_attr_tensor(np.array(repeats, dtype='int32'))
+                graph_converter.add_operator(tfl.TileOperator([val_reshaped, repeat_tensor], [actual_val]))
+            else:
+                actual_val = self.create_attr_tensor(np.broadcast_to(val_tensor.tensor, target_val_shape))
+
+        shape_tensor = self.create_attr_tensor(np.array(input_tensor.shape, dtype='int32'))
+
+        if input_tensor.buffer is None or index_tensor.buffer is None:
+            old_val_tensor = self.create_transform_tensor(actual_val.tensor)
+            graph_converter.add_operator(tfl.GatherNdOperator([input_tensor, index_tensor], [old_val_tensor]))
+        else:
+            transformed_index = tuple(index_tensor.tensor[..., i] for i in range(index_tensor.shape[-1]))
+            old_val_tensor = self.create_attr_tensor(input_tensor.tensor[transformed_index])
+
+        if actual_val.buffer is None:
+            update_tensor = self.create_transform_tensor(actual_val.tensor - old_val_tensor.tensor)
+            graph_converter.add_operator(tfl.SubOperator([actual_val, old_val_tensor], [update_tensor]))
+        else:
+            update_tensor = self.create_attr_tensor(actual_val.tensor - old_val_tensor.tensor)
+
+        updated_tensor = self.create_transform_tensor(input_tensor.tensor)
+        graph_converter.add_operator(
+            tfl.ScatterNdOperator([index_tensor, update_tensor, shape_tensor], [updated_tensor])
+        )
+
+        graph_converter.add_operator(tfl.AddOperator([input_tensor, updated_tensor], [output_tensor]))
+
+
 class ATenGeluOperator(ATenGeluSchema):
     def parse(self, node, attrs, args, graph_converter):
         super().parse(node, attrs, args, graph_converter)
@@ -3047,26 +3489,38 @@ class ATenGeluOperator(ATenGeluSchema):
         ops = []
 
         input_tensor = self.find_or_create_input(0, graph_converter)
-        constant_tensor = self.create_attr_tensor(np.array([1.702], dtype='float32'))
-        sigmoid_in = self.create_transform_tensor(input_tensor.tensor * constant_tensor.tensor)
-
-        actual_input = input_tensor
         output_tensor = self.to_tfl_tensors(self.output_names, self.output_tensors)[0]
-        if input_tensor.quantization is not None:
-            actual_input = self.create_transform_tensor(actual_input.tensor.astype('float32'))
-            ops.append(tfl.DequantizeOperator([input_tensor], [actual_input]))
 
-        ops.append(tfl.MulOperator([actual_input, constant_tensor], [sigmoid_in]))
+        approximate = "none"
+        if 'approximate' in args:
+            approximate = self.input_tensors[args['approximate']] or "none"
 
-        sigmoid_out = self.create_transform_tensor(torch.sigmoid(torch.from_numpy(input_tensor.tensor)).numpy())
-        ops.append(tfl.LogisticOperator([sigmoid_in], [sigmoid_out]))
+        if self.legacy_gelu:
+            if approximate == "none":
+                warnings.warn('aten::gelu[approximate="none"] is not supported with legacy_gelu=True')
 
-        if input_tensor.quantization is not None:
-            actual_output = self.create_transform_tensor(output_tensor.tensor.astype('float32'))
-            ops.append(tfl.MulOperator([sigmoid_out, actual_input], [actual_output]))
-            ops.append(tfl.QuantizeOperator([actual_output], [output_tensor]))
+            constant_tensor = self.create_attr_tensor(np.array([1.702], dtype='float32'))
+            sigmoid_in = self.create_transform_tensor(input_tensor.tensor * constant_tensor.tensor)
+
+            actual_input = input_tensor
+            if input_tensor.quantization is not None:
+                actual_input = self.create_transform_tensor(actual_input.tensor.astype('float32'))
+                ops.append(tfl.DequantizeOperator([input_tensor], [actual_input]))
+
+            ops.append(tfl.MulOperator([actual_input, constant_tensor], [sigmoid_in]))
+
+            sigmoid_out = self.create_transform_tensor(torch.sigmoid(torch.from_numpy(input_tensor.tensor)).numpy())
+            ops.append(tfl.LogisticOperator([sigmoid_in], [sigmoid_out]))
+
+            if input_tensor.quantization is not None:
+                actual_output = self.create_transform_tensor(output_tensor.tensor.astype('float32'))
+                ops.append(tfl.MulOperator([sigmoid_out, actual_input], [actual_output]))
+                ops.append(tfl.QuantizeOperator([actual_output], [output_tensor]))
+            else:
+                ops.append(tfl.MulOperator([sigmoid_out, actual_input], [output_tensor]))
         else:
-            ops.append(tfl.MulOperator([sigmoid_out, actual_input], [output_tensor]))
+            op = tfl.GeluOperator([input_tensor], [output_tensor], approximate == "none")
+            ops.append(op)
 
         for op in ops:
             graph_converter.add_operator(op)
@@ -3183,7 +3637,7 @@ class ATenEqOperator(ATenEqSchema):
         super().parse(node, attrs, args, graph_converter)
 
         self.run(node)
-        if type(self.input_tensors[1]) != torch.Tensor:
+        if not isinstance(self.input_tensors[1], torch.Tensor):
             self.input_tensors[1] = self.torch_tensor_from_scalar(self.input_tensors[0], self.input_tensors[1])
 
         self.elementwise_binary(tfl.EqualOperator, graph_converter, True)
@@ -3279,7 +3733,11 @@ class ATenMinOperator(ATenMinSchema):
         super().parse(node, attrs, args, graph_converter)
 
         self.run(node)
-        self.handle_reduce(tfl.ReduceMinOperator, args, graph_converter, False)
+
+        if 'other' in args:
+            self.elementwise_binary(tfl.MinimumOperator, graph_converter, True)
+        else:
+            self.handle_reduce(tfl.ReduceMinOperator, args, graph_converter, False)
 
 
 class ATenMaxOperator(ATenMaxSchema):
@@ -3287,7 +3745,11 @@ class ATenMaxOperator(ATenMaxSchema):
         super().parse(node, attrs, args, graph_converter)
 
         self.run(node)
-        self.handle_reduce(tfl.ReduceMaxOperator, args, graph_converter, False)
+
+        if 'other' in args:
+            self.elementwise_binary(tfl.MaximumOperator, graph_converter, True)
+        else:
+            self.handle_reduce(tfl.ReduceMaxOperator, args, graph_converter, False)
 
 
 class ATenAminOperator(ATenAminSchema):
@@ -3321,7 +3783,7 @@ class ATenGluOperator(ATenGluSchema):
         ops = []
 
         mid_arrs = np.split(input_tensor.tensor, 2, axis=dim)
-        dim_tensor = self.create_attr_tensor(np.array([dim], dtype='int32'))
+        dim_tensor = self.create_attr_tensor(np.array(dim, dtype='int32'))
         mid_tensors = [self.create_transform_tensor(t) for t in mid_arrs]
         ops.append(tfl.SplitOperator([dim_tensor, input_tensor], mid_tensors, 2))
 
@@ -3346,7 +3808,7 @@ class ATenMaskedFillOperator(ATenMaskedFillSchema):
     def parse_common(self, graph_converter, input_idx=0, mask_idx=1, other_idx=2, out_idx=0):
         for i in (input_idx, other_idx):
             t = self.input_tensors[i]
-            if type(t) == torch.Tensor:
+            if type(t) is torch.Tensor:
                 if t.dtype == torch.float64:
                     self.input_tensors[i] = t.to(dtype=torch.float32)
                 elif t.dtype == torch.int64:
@@ -3364,7 +3826,7 @@ class ATenMaskedFillOperator(ATenMaskedFillSchema):
         input_tensor, mask_tensor = [self.find_or_create_input(i, graph_converter) for i in (input_idx, mask_idx)]
 
         ops = []
-        if type(other) == torch.Tensor:
+        if type(other) is torch.Tensor:
             other_t = self.find_or_create_input(other_idx, graph_converter)
             if out.dtype != other.dtype:
                 casted = other.clone().to(dtype=out.dtype)
@@ -3444,12 +3906,34 @@ class ATenMaskedFillOperator(ATenMaskedFillSchema):
             graph_converter.add_operator(op)
 
 
+class ATenMaximumOperator(ATenMaximumSchema):
+    def parse(self, node, attrs, args, graph_converter):
+        super().parse(node, attrs, args, graph_converter)
+
+        self.run(node)
+        if not isinstance(self.input_tensors[1], torch.Tensor):
+            self.input_tensors[1] = self.torch_tensor_from_scalar(self.input_tensors[0], self.input_tensors[1])
+
+        self.elementwise_binary(tfl.MaximumOperator, graph_converter, True)
+
+
+class ATenMinimumOperator(ATenMinimumSchema):
+    def parse(self, node, attrs, args, graph_converter):
+        super().parse(node, attrs, args, graph_converter)
+
+        self.run(node)
+        if not isinstance(self.input_tensors[1], torch.Tensor):
+            self.input_tensors[1] = self.torch_tensor_from_scalar(self.input_tensors[0], self.input_tensors[1])
+
+        self.elementwise_binary(tfl.MinimumOperator, graph_converter, True)
+
+
 class ATenGtOperator(ATenGtSchema):
     def parse(self, node, attrs, args, graph_converter):
         super().parse(node, attrs, args, graph_converter)
 
         self.run(node)
-        if type(self.input_tensors[1]) != torch.Tensor:
+        if not isinstance(self.input_tensors[1], torch.Tensor):
             self.input_tensors[1] = self.torch_tensor_from_scalar(self.input_tensors[0], self.input_tensors[1])
 
         self.elementwise_binary(tfl.GreaterOperator, graph_converter, True)
@@ -3460,7 +3944,7 @@ class ATenLtOperator(ATenLtSchema):
         super().parse(node, attrs, args, graph_converter)
 
         self.run(node)
-        if type(self.input_tensors[1]) != torch.Tensor:
+        if not isinstance(self.input_tensors[1], torch.Tensor):
             self.input_tensors[1] = self.torch_tensor_from_scalar(self.input_tensors[0], self.input_tensors[1])
 
         self.elementwise_binary(tfl.LessOperator, graph_converter, True)
@@ -3471,7 +3955,7 @@ class ATenGeOperator(ATenGeSchema):
         super().parse(node, attrs, args, graph_converter)
 
         self.run(node)
-        if type(self.input_tensors[1]) != torch.Tensor:
+        if not isinstance(self.input_tensors[1], torch.Tensor):
             self.input_tensors[1] = self.torch_tensor_from_scalar(self.input_tensors[0], self.input_tensors[1])
 
         self.elementwise_binary(tfl.GreaterEqualOperator, graph_converter, np.True_)
@@ -3482,7 +3966,7 @@ class ATenLeOperator(ATenLeSchema):
         super().parse(node, attrs, args, graph_converter)
 
         self.run(node)
-        if type(self.input_tensors[1]) != torch.Tensor:
+        if not isinstance(self.input_tensors[1], torch.Tensor):
             self.input_tensors[1] = self.torch_tensor_from_scalar(self.input_tensors[0], self.input_tensors[1])
 
         self.elementwise_binary(tfl.LessEqualOperator, graph_converter, True)
@@ -3493,7 +3977,7 @@ class ATenRemainderOperator(ATenRemainderSchema):
         super().parse(node, attrs, args, graph_converter)
 
         self.run(node)
-        if type(self.input_tensors[1]) != torch.Tensor:
+        if not isinstance(self.input_tensors[1], torch.Tensor):
             self.input_tensors[1] = torch.tensor([self.input_tensors[1]], dtype=self.input_tensors[0].dtype)
 
         self.elementwise_binary(tfl.FloorModOperator, graph_converter, True)
@@ -3506,7 +3990,7 @@ class ATenWhereOperator(ATenWhereSchema):
         self.run(node)
         assert 'self' in args and 'other' in args, "aten::where(condition) is not supported"
 
-        if type(self.input_tensors[2]) != torch.Tensor:
+        if not isinstance(self.input_tensors[2], torch.Tensor):
             self.input_tensors[2] = torch.tensor([self.input_tensors[2]])
 
         ATenMaskedFillOperator.parse_common(self, graph_converter, input_idx=2, mask_idx=0, other_idx=1)
@@ -3587,7 +4071,11 @@ class ATenUnbindOperator(ATenUnbindSchema):
         graph_converter.add_iterable_pair(self.output_names, output_names, 'input')
         outputs = self.to_tfl_tensors(output_names, self.output_tensors[0])
 
-        graph_converter.add_operator(tfl.UnpackOperator([input_tensor], outputs, chunks, dim))
+        if str(input_tensor.dtype) == 'int64' and input_tensor.tensor.ndim == 1 and input_tensor.tensor.size == 1:
+            shape_tensor = self.create_attr_tensor(np.array((), dtype='int32'))
+            graph_converter.add_operator(tfl.ReshapeOperator([input_tensor, shape_tensor], outputs, []))
+        else:
+            graph_converter.add_operator(tfl.UnpackOperator([input_tensor], outputs, chunks, dim))
 
 
 class ATenRollOperator(ATenRollSchema):
@@ -3631,7 +4119,7 @@ class ATenRollOperator(ATenRollSchema):
             actual_shift = shift % dim_size
             if actual_shift != 0:
                 split_sizes = self.create_attr_tensor(np.array([dim_size - actual_shift, actual_shift], dtype='int32'))
-                dim_tensor = self.create_attr_tensor(np.array([dim], dtype='int32'))
+                dim_tensor = self.create_attr_tensor(np.array(dim, dtype='int32'))
                 chunks = 2
 
                 splitted = [
@@ -3762,6 +4250,20 @@ class ATenNormOperator(ATenNormSchema):
 
         for op in ops:
             graph_converter.add_operator(op)
+
+    def parse(self, node, attrs, args, graph_converter):
+        super().parse(node, attrs, args, graph_converter)
+
+        self.run(node)
+        self.parse_common(node, attrs, args, graph_converter)
+
+
+class ATenFrobeniusNormOperator(ATenFrobeniusNormSchema):
+    def parse_common(self, node, attrs, args, graph_converter):
+
+        assert 'p' not in args
+        self.input_tensors.insert(1, 2)
+        ATenNormOperator.parse_common(self, node, attrs, args, graph_converter)
 
     def parse(self, node, attrs, args, graph_converter):
         super().parse(node, attrs, args, graph_converter)

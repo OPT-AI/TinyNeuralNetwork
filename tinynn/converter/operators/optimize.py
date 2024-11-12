@@ -50,6 +50,8 @@ class GraphOptimizer(object):
         max_transpose_dims: int = -1,
         bypass_elementwise_passthrough_constraint: bool = False,
         group_tensors: bool = False,
+        conv_transpose_with_bias: bool = True,
+        hybrid_int16_lstm: bool = False,
     ) -> None:
         self.graph = graph
         self.fuse_tensor_count = 0
@@ -65,6 +67,8 @@ class GraphOptimizer(object):
         self.max_transpose_dims = max_transpose_dims
         self.bypass_elementwise_passthrough_constraint = bypass_elementwise_passthrough_constraint
         self.group_tensors = group_tensors
+        self.conv_transpose_with_bias = conv_transpose_with_bias
+        self.hybrid_int16_lstm = hybrid_int16_lstm
 
     def create_attr_tensor(
         self, tensor: tfl.Tensor, name: str = None, quantization: typing.Optional[tfl.QuantizationParameters] = None
@@ -165,6 +169,68 @@ class GraphOptimizer(object):
             assert vertex['node_type'] == ExtendedOperator.BATCH_NORM
         self.graph.graph.delete_vertices(remove_ids)
 
+    @class_conditional(lambda self: self.level >= GraphOptimizer.FUSE_BN)
+    def fuse_bn_conv(self):
+        edges = self.graph.graph.es.select(functools.partial(is_rev_bn_fusable_edge, graph_converter=self.graph.graph))
+        filtered_pairs = ((self.graph.graph.vs[x.source], self.graph.graph.vs[x.target]) for x in edges)
+
+        def _remove_last_pred(seq):
+            bn = seq[0]
+            conv = seq[1]
+
+            # Collect the arguments of the conv and batch-norm nodes
+            weight = conv['op'].inputs[1]
+            bias = conv['op'].inputs[2] if len(conv['op'].inputs) > 2 else None
+            bn_w, bn_b, bn_mean, bn_var = bn['op'].inputs[1:]
+            bn_w, bn_b, bn_mean, bn_var = (
+                bn_w.tensor.copy(),
+                bn_b.tensor.copy(),
+                bn_mean.tensor.copy(),
+                bn_var.tensor.copy(),
+            )
+            activ_w = weight.tensor.copy()
+            activ_b = bias.tensor.copy() if bias is not None else None
+            eps = bn['op'].eps
+
+            new_weight = fuse_rev_bn_weight(eps, bn_w, bn_var, activ_w)
+            new_bias = fuse_rev_bn_bias(eps, bn_w, bn_var, bn_mean, bn_b, activ_b, activ_w)
+
+            return False, (conv, bias, new_weight, new_bias)
+
+        def _remove_last_action(first_node, last_node, custom_data):
+            conv, bias, new_weight, new_bias = custom_data
+
+            new_w = self.create_attr_tensor(new_weight)
+            new_b = self.create_attr_tensor(new_bias)
+
+            actions = []
+            actions.append((self.graph.replace_operator_input, (conv, 1, new_w)))
+            if bias is not None:
+                actions.append((self.graph.replace_operator_input, (conv, 2, new_b)))
+            else:
+                actions.append((self.graph.append_operator_input, (conv, new_b)))
+            return actions
+
+        def _skip_pred(seq):
+            bn = seq[0]['op']
+            conv = seq[1]['op']
+
+            skip = bn.inputs[0].quantization is not None or (
+                conv.inputs[1].shape[1] == 1 and conv.inputs[1].shape[0] == conv.groups and conv.groups > 1
+            )
+            return skip
+
+        elinimate_sequences(
+            self.graph,
+            filtered_pairs,
+            True,
+            None,
+            _remove_last_pred,
+            _remove_last_action,
+            _skip_pred,
+            force_forward_input=True,
+        )
+
     @class_conditional(lambda self: self.level >= GraphOptimizer.COMMON_OPTIMIZE)
     def fuse_activation(self):
         # Find fusable ops
@@ -173,6 +239,9 @@ class GraphOptimizer(object):
 
         remove_ids = []
         for pre_activ, activ, tensor in filtered_pairs:
+            if not self.conv_transpose_with_bias and pre_activ['node_type'] == ExtendedOperator.GENERIC_DECONV:
+                continue
+
             # Find out the output of the batch-norm nodes
             new_output = activ['outputs'][0]
             assert new_output in self.graph.tensor_map
@@ -436,6 +505,58 @@ class GraphOptimizer(object):
         self.graph.graph.delete_vertices(remove_ids)
 
     @class_conditional(lambda self: self.level >= GraphOptimizer.COMMON_OPTIMIZE)
+    def remove_tile_before_binary_elementwise_ops(self):
+        # Find fusable ops
+        edges = self.graph.graph.es.select(functools.partial(is_tile_binary_op_edge, graph_converter=self.graph.graph))
+        filtered_pairs = ((self.graph.graph.vs[x.source], self.graph.graph.vs[x.target], x) for x in edges)
+
+        remove_ids = []
+        actions = []
+        binary_op_ids = set()
+        for tile, op_node, tensor in filtered_pairs:
+            tile_op = tile['op']
+            binary_op = op_node['op']
+
+            input_idx = None
+            for i in range(2):
+                try:
+                    _ = tile['outputs'].index(binary_op.inputs[i].name)
+                    input_idx = i
+                    break
+                except ValueError:
+                    pass
+
+            if input_idx is None:
+                continue
+
+            alter_input_idx = 1 - input_idx
+            try:
+                out_shape = np.broadcast_shapes(binary_op.inputs[alter_input_idx].shape, tile_op.inputs[0].shape)
+                if out_shape != binary_op.outputs[0].shape:
+                    continue
+            except ValueError:
+                continue
+
+            if op_node.index not in binary_op_ids:
+                binary_op_ids.add(op_node.index)
+            else:
+                continue
+
+            new_tensor = tile_op.inputs[0]
+
+            # Replace input tensors
+            actions.append((self.graph.replace_operator_input, (op_node, input_idx, new_tensor)))
+
+            # remove tile op
+            remove_ids.append(tile.index)
+
+        # Process actions
+        for func, args in actions:
+            func(*args)
+        # Delete tile nodes
+        self.graph.graph.delete_vertices(remove_ids)
+
+    @class_conditional(lambda self: self.level >= GraphOptimizer.COMMON_OPTIMIZE)
     def fuse_conv2d_gather(self):
         # Find fusable ops
         edges = self.graph.graph.es.select(functools.partial(is_conv2d_gather_edge, graph_converter=self.graph.graph))
@@ -492,6 +613,46 @@ class GraphOptimizer(object):
             func(*args)
         # Delete activation nodes
         self.graph.graph.delete_vertices(remove_ids)
+
+    @class_conditional(lambda self: self.level >= GraphOptimizer.COMMON_OPTIMIZE)
+    def fuse_gather_conv2d(self):
+        # Find fusable ops
+        edges = self.graph.graph.es.select(functools.partial(is_gather_conv2d_edge, graph_converter=self.graph.graph))
+        filtered_pairs = ((self.graph.graph.vs[x.source], self.graph.graph.vs[x.target]) for x in edges)
+
+        def _remove_last_pred(seq):
+            gather = seq[0]
+            conv = seq[1]
+            return False, (gather, conv)
+
+        def _remove_last_action(first_node, last_node, custom_data):
+            gather, conv = custom_data
+
+            actions = []
+
+            indx = np.argsort(gather['op'].inputs[1].tensor)
+            w = conv['op'].inputs[1].tensor.copy()
+            w_quant_param = conv['op'].inputs[1].quantization
+            new_w = np.take(w, indx, axis=3)
+            if w_quant_param is not None and isinstance(w_quant_param.scale, list) and w_quant_param.dim == 3:
+                new_w_scale = np.take(w_quant_param.scale, indx, axis=0)
+                new_w_zeros = np.take(w_quant_param.zero_point, indx, axis=0)
+                w_quant_param.scale = new_w_scale
+                w_quant_param.zero_point = new_w_zeros
+            new_w = self.create_attr_tensor(new_w, quantization=w_quant_param)
+            actions.append((self.graph.replace_operator_input, (conv, 1, new_w)))
+            return actions
+
+        elinimate_sequences(
+            self.graph,
+            filtered_pairs,
+            True,
+            None,
+            _remove_last_pred,
+            _remove_last_action,
+            False,
+            force_forward_input=True,
+        )
 
     @class_conditional(lambda self: self.tflite_micro_rewrite)
     def split_requantize(self):
@@ -622,6 +783,54 @@ class GraphOptimizer(object):
             return [action]
 
         elinimate_sequences(self.graph, filtered_pairs, _remove_first_pred, _remove_first_action)
+
+    @class_conditional(lambda self: self.level >= GraphOptimizer.COMMON_OPTIMIZE)
+    def fuse_simple_gather_pass(self):
+        edges = self.graph.graph.es.select(functools.partial(is_gather_fusable_edge, graph_converter=self.graph.graph))
+        filtered_pairs = [[self.graph.graph.vs[x.source], self.graph.graph.vs[x.target]] for x in edges]
+
+        # Try to fuse the edges
+        filtered_pairs = fuse_connected_edges(filtered_pairs)
+
+        def _remove_first_pred(seq):
+            new_perm = fuse_transpose_perms(seq)
+
+            hints = set()
+            for node in seq:
+                if 'direction' in node['op'].extra_hints:
+                    hints.add(node['op'].extra_hints['direction'])
+
+            if len(hints) == 1:
+                hint = next(iter(hints))
+            else:
+                hint = None
+
+            remove_first = np.array_equal(new_perm, np.sort(new_perm))
+            return remove_first, (new_perm, hint)
+
+        def _remove_first_action(first_node, last_node, custom_data):
+            # Set fused perm to the first transpose node
+            new_perm, hint = custom_data
+            if hint is None:
+                if 'direction' in first_node['op'].extra_hints:
+                    del first_node['op'].extra_hints['direction']
+            else:
+                first_node['op'].extra_hints['direction'] = hint
+            new_perm_tensor = self.create_attr_tensor(new_perm)
+            action = (self.graph.replace_operator_input, (first_node, 1, new_perm_tensor))
+            return [action]
+
+        def _skip_pred(seq):
+            for node in seq:
+                op = node['op']
+                idx_tensor = op.inputs[1]
+                if idx_tensor.buffer is None:
+                    return True
+                if len(idx_tensor.shape) > 1:
+                    return True
+            return False
+
+        elinimate_sequences(self.graph, filtered_pairs, _remove_first_pred, _remove_first_action, skip_pred=_skip_pred)
 
     @class_conditional(lambda self: self.level >= GraphOptimizer.COMMON_OPTIMIZE)
     def fuse_dequant_quant_pass(self, q_first):
@@ -807,12 +1016,18 @@ class GraphOptimizer(object):
                 if tensor.quantization is None:
                     t_idx = (tensor.buffer.data, tensor.dtype, tensor.shape)
                 else:
+                    scale = tensor.quantization.scale
+                    zero_point = tensor.quantization.zero_point
+                    if isinstance(scale, list):
+                        scale = tuple(scale)
+                    if isinstance(zero_point, list):
+                        zero_point = tuple(zero_point)
                     t_idx = (
                         tensor.buffer.data,
                         tensor.dtype,
                         tensor.shape,
-                        tensor.quantization.scale,
-                        tensor.quantization.zero_point,
+                        scale,
+                        zero_point,
                         tensor.quantization.dim,
                     )
 
@@ -1110,8 +1325,11 @@ class GraphOptimizer(object):
         actions = []
         remove_edges = []
         remove_vertices = []
+        processed_nodes = set()
         num_actions = 0
         for node in unique_nodes:
+            pending_processed_nodes = set()
+
             op = node['op']
             input_indices = op_input_indices(op)
             l_shape = op.inputs[0].shape
@@ -1147,6 +1365,20 @@ class GraphOptimizer(object):
 
             # TODO: Support multi-multi mappings
             if mode == '?':
+                # reset hints if passthrough is not possible
+                for i in input_indices:
+                    prev_node_name = op.inputs[i].name
+                    prev_node = self.graph.graph.vs.find(name=self.graph.tensor_node_map[prev_node_name])
+                    if prev_node['node_type'] == ExtendedOperator.TRANSPOSE:
+                        if 'direction' in prev_node['op'].extra_hints:
+                            prev_node['op'].extra_hints.pop('direction')
+                for edge in node.out_edges():
+                    if edge.index in remove_edges:
+                        continue
+                    next_node = self.graph.graph.vs[edge.target]
+
+                    if 'direction' in next_node['op'].extra_hints:
+                        next_node['op'].extra_hints.pop('direction')
                 continue
 
             check_consecutive_indices = []
@@ -1176,6 +1408,7 @@ class GraphOptimizer(object):
             prev_output_indices = []
             num_constant_nodes = 0
             prev_hints = set()
+            skip = False
             for i in input_indices:
                 prev_node_name = op.inputs[i].name
                 prev_node = self.graph.graph.vs.find(name=self.graph.tensor_node_map[prev_node_name])
@@ -1183,6 +1416,10 @@ class GraphOptimizer(object):
                 prev_output_indices.append(prev_node['outputs'].index(prev_node_name))
 
                 if prev_node['node_type'] == ExtendedOperator.TRANSPOSE:
+                    if prev_node['name'] in processed_nodes:
+                        skip = True
+                        break
+                    pending_processed_nodes.add(prev_node['name'])
                     if mode == 'down':
                         perm = tuple(prev_node['op'].inputs[1].tensor.tolist())
                         cand_perms.setdefault(perm, 0)
@@ -1197,7 +1434,7 @@ class GraphOptimizer(object):
                 if prev_node['node_type'] == ExtendedOperator.CONSTANT_NODE:
                     num_constant_nodes += 1
 
-            if self.level >= GraphOptimizer.BRANCH_OPTIMIZE_EXTENDED and 'up' in prev_hints:
+            if skip or (self.level >= GraphOptimizer.BRANCH_OPTIMIZE_EXTENDED and 'up' in prev_hints):
                 continue
 
             next_nodes = []
@@ -1212,6 +1449,10 @@ class GraphOptimizer(object):
                 if next_node['node_type'] == ExtendedOperator.OUTPUT_NODE:
                     out_nodes.append(next_node)
                 else:
+                    if next_node['name'] in processed_nodes:
+                        skip = True
+                        break
+                    pending_processed_nodes.add(next_node['name'])
                     next_nodes.append(next_node)
                     next_edges.append(edge)
 
@@ -1227,7 +1468,7 @@ class GraphOptimizer(object):
                     if 'direction' in next_node['op'].extra_hints:
                         next_hints.add(next_node['op'].extra_hints['direction'])
 
-            if self.level >= GraphOptimizer.BRANCH_OPTIMIZE_EXTENDED and 'down' in next_hints:
+            if skip or (self.level >= GraphOptimizer.BRANCH_OPTIMIZE_EXTENDED and 'down' in next_hints):
                 continue
 
             cur_transpose_size = sum(cand_perms.values()) + sum(cand_rev_perms.values())
@@ -1241,6 +1482,9 @@ class GraphOptimizer(object):
                 if self.level >= GraphOptimizer.BRANCH_OPTIMIZE_EXTENDED:
                     if 'down' in prev_hints or 'up' in next_hints:
                         skip = False
+
+            if skip:
+                continue
 
             perm = max(cand_perms.items(), key=lambda x: x[1])[0]
             perm_arr = np.array(perm, dtype='int32')
@@ -1265,6 +1509,9 @@ class GraphOptimizer(object):
 
             remove_edges.extend([x.index for x in next_edges])
             remove_vertices.extend([x.index for x in out_nodes])
+
+            for pending_processed_node in pending_processed_nodes:
+                processed_nodes.add(pending_processed_node)
 
             for n in out_nodes:
                 del self.graph.tensor_map[n['outputs'][0]]
@@ -1348,7 +1595,9 @@ class GraphOptimizer(object):
     @class_conditional(lambda self: self.rewrite_quantizable)
     def elementwise_op_quantize_passthrough_pass(self):
         edges = self.graph.graph.es.select(
-            functools.partial(is_quantize_elementwise_op_edge, graph_converter=self.graph.graph)
+            functools.partial(
+                is_quantize_elementwise_op_edge, graph_converter=self.graph.graph, with_lstm=self.hybrid_int16_lstm
+            )
         )
         pairs = ((self.graph.graph.vs[edge.source], self.graph.graph.vs[edge.target]) for edge in edges)
         filtered_nodes = (k[0] if k[0]['node_type'] != ExtendedOperator.DEQUANTIZE else k[1] for k in pairs)
@@ -1792,19 +2041,23 @@ class GraphOptimizer(object):
                 tensor_node_dict[op_out.name] = self.graph.graph.vs.find(name=self.graph.tensor_node_map[op_out.name])
 
             # OP specific dim handling logic
-            if node['node_type'] in (ExtendedOperator.CONCATENATION, ExtendedOperator.GATHER):
+            if node['node_type'] in (ExtendedOperator.CONCATENATION, ExtendedOperator.GATHER, ExtendedOperator.UNPACK):
                 old_axis = op.axis
                 new_axis = np.where(inv_perm_arr == old_axis)[0][0]
+                op.axis = new_axis
+            elif node['node_type'] == ExtendedOperator.PACK:
+                old_axis = op.axis
+                new_axis = np.where(inv_perm_arr_post == old_axis)[0][0]
                 op.axis = new_axis
             elif node['node_type'] == ExtendedOperator.SPLIT_V:
                 old_dim = op.inputs[2].tensor
                 new_dim = np.where(inv_perm_arr == old_dim)[0][0]
-                new_dim_tensor = self.create_attr_tensor(np.array([new_dim], dtype='int32'))
+                new_dim_tensor = self.create_attr_tensor(np.array(new_dim, dtype='int32'))
                 actions.append((self.graph.replace_operator_input, (node, 2, new_dim_tensor, True)))
             elif node['node_type'] == ExtendedOperator.SPLIT:
                 old_dim = op.inputs[0].tensor
                 new_dim = np.where(inv_perm_arr == old_dim)[0][0]
-                new_dim_tensor = self.create_attr_tensor(np.array([new_dim], dtype='int32'))
+                new_dim_tensor = self.create_attr_tensor(np.array(new_dim, dtype='int32'))
                 actions.append((self.graph.replace_operator_input, (node, 0, new_dim_tensor, True)))
             elif node['node_type'] in (
                 ExtendedOperator.PAD,
@@ -1826,7 +2079,12 @@ class GraphOptimizer(object):
                     actions.append((self.graph.replace_operator_input, (node, 1, new_weight, True)))
             elif node['node_type'] in (ExtendedOperator.SLICE, ExtendedOperator.STRIDED_SLICE):
                 for i, t in enumerate(op.inputs[1:]):
-                    new_t = self.create_attr_tensor(t.tensor[inv_perm_arr])
+                    if t.buffer is None:
+                        new_perm_t = self.create_attr_tensor(np.array(inv_perm_arr, dtype='int32'))
+                        new_t = self.create_transform_tensor(t.tensor[inv_perm_arr])
+                        self.graph.add_operator(tfl.TransposeOperator([t, new_perm_t], [new_t]))
+                    else:
+                        new_t = self.create_attr_tensor(t.tensor[inv_perm_arr])
                     actions.append((self.graph.replace_operator_input, (node, i + 1, new_t, True)))
             elif node['node_type'] in (
                 ExtendedOperator.SUM,
@@ -2154,11 +2412,11 @@ class GraphOptimizer(object):
                 op.axis = new_axis
             elif node['node_type'] == ExtendedOperator.SPLIT_V:
                 new_dim = prev_shape.index(-1)
-                new_dim_tensor = self.create_attr_tensor(np.array([new_dim], dtype='int32'))
+                new_dim_tensor = self.create_attr_tensor(np.array(new_dim, dtype='int32'))
                 actions.append((self.graph.replace_operator_input, (node, 2, new_dim_tensor, True)))
             elif node['node_type'] == ExtendedOperator.SPLIT:
                 new_dim = prev_shape.index(-1)
-                new_dim_tensor = self.create_attr_tensor(np.array([new_dim], dtype='int32'))
+                new_dim_tensor = self.create_attr_tensor(np.array(new_dim, dtype='int32'))
                 actions.append((self.graph.replace_operator_input, (node, 0, new_dim_tensor, True)))
             elif node['node_type'] in (ExtendedOperator.PAD, ExtendedOperator.PADV2, ExtendedOperator.MIRROR_PAD):
                 old_pad = op.inputs[1].tensor
@@ -2199,11 +2457,63 @@ class GraphOptimizer(object):
 
                 new_start = np.zeros(len(prev_shape), dtype='int32')
                 new_start[new_dim] = op.inputs[1].tensor[old_dim]
-                new_start_t = self.create_attr_tensor(new_start)
+                if op.inputs[1].buffer is None:
+                    new_start_t = self.create_transform_tensor(new_start)
+                    starts_mid = new_start[new_dim : new_dim + 1]
+                    starts_mid_tensor = self.create_transform_tensor(starts_mid)
+
+                    slice_inputs = [
+                        op.inputs[1],
+                        self.create_attr_tensor(np.array([old_dim], dtype='int32')),
+                        self.create_attr_tensor(np.array([1], dtype='int32')),
+                    ]
+
+                    self.graph.add_operator(tfl.SliceOperator(slice_inputs, [starts_mid_tensor]))
+
+                    starts_left = new_start[:new_dim]
+                    starts_right = new_start[new_dim + 1 :]
+                    starts_tensors = []
+                    if len(starts_left) > 0:
+                        starts_tensors.append(self.create_attr_tensor(starts_left))
+                    starts_tensors.append(starts_mid_tensor)
+                    if len(starts_right) > 0:
+                        starts_tensors.append(self.create_attr_tensor(starts_right))
+                    if len(starts_tensors) > 1:
+                        self.graph.add_operator(tfl.ConcatenationOperator(starts_tensors, [new_start_t], 0))
+                    else:
+                        new_start_t = starts_tensors[0]
+                else:
+                    new_start_t = self.create_attr_tensor(new_start)
 
                 new_end = np.array(prev_shape, dtype='int32')
                 new_end[new_dim] = op.inputs[2].tensor[old_dim]
-                new_end_t = self.create_attr_tensor(new_end)
+                if op.inputs[2].buffer is None:
+                    new_end_t = self.create_transform_tensor(new_end)
+                    ends_mid = new_end[new_dim : new_dim + 1]
+                    ends_mid_tensor = self.create_transform_tensor(ends_mid)
+
+                    slice_inputs = [
+                        op.inputs[2],
+                        self.create_attr_tensor(np.array([old_dim], dtype='int32')),
+                        self.create_attr_tensor(np.array([1], dtype='int32')),
+                    ]
+
+                    self.graph.add_operator(tfl.SliceOperator(slice_inputs, [ends_mid_tensor]))
+
+                    ends_left = new_end[:new_dim]
+                    ends_right = new_end[new_dim + 1 :]
+                    ends_tensors = []
+                    if len(ends_left) > 0:
+                        ends_tensors.append(self.create_attr_tensor(ends_left))
+                    ends_tensors.append(ends_mid_tensor)
+                    if len(ends_right) > 0:
+                        ends_tensors.append(self.create_attr_tensor(ends_right))
+                    if len(ends_tensors) > 1:
+                        self.graph.add_operator(tfl.ConcatenationOperator(ends_tensors, [new_end_t], 0))
+                    else:
+                        new_end_t = ends_tensors[0]
+                else:
+                    new_end_t = self.create_attr_tensor(new_end)
 
                 new_stride = np.ones(len(prev_shape), dtype='int32')
                 new_stride[new_dim] = op.inputs[3].tensor[old_dim]
@@ -2500,7 +2810,7 @@ class GraphOptimizer(object):
             else:
                 biases = [None] * num_chunks
 
-            dim_tensor = self.create_attr_tensor(np.array([3], dtype='int32'))
+            dim_tensor = self.create_attr_tensor(np.array(3, dtype='int32'))
             ops.append(tfl.SplitOperator([dim_tensor, input_tensor], input_tensors, num_chunks))
 
             for it, ot, w, b in zip(input_tensors, output_tensors, weights, biases):
@@ -2599,7 +2909,7 @@ class GraphOptimizer(object):
             new_os = output_shape_tensor.tensor.copy()
             new_os[3] = num_weight_channel
             new_ost = self.create_attr_tensor(new_os)
-            dim_tensor = self.create_attr_tensor(np.array([3], dtype='int32'))
+            dim_tensor = self.create_attr_tensor(np.array(3, dtype='int32'))
             ops.append(tfl.SplitOperator([dim_tensor, input_tensor], input_tensors, num_chunks))
 
             for it, ot, w, b in zip(input_tensors, output_tensors, weights, biases):
@@ -3200,6 +3510,7 @@ class GraphOptimizer(object):
         self.fuse_simple_reshape_pass()
         self.branch_transpose_expand_pass()
         self.fuse_simple_transpose_pass()
+        self.fuse_simple_gather_pass()
         for branch in (False, True):
             self.remove_noop_pass(branch)
         self.fuse_wrapped_reshape_within_transpose_pass()
@@ -3227,6 +3538,7 @@ class GraphOptimizer(object):
         self.fuse_conv_fc_bn()
         self.fuse_activation()
         self.fuse_requantize()
+        self.fuse_bn_conv()
 
         # Convert TinyNeuralNetwork ops to TFLite ops
         self.transform_graph()
@@ -3273,6 +3585,7 @@ class GraphOptimizer(object):
         # Transpose and reshape cleanup
         for _ in range(2):
             self.transpose_to_reshape_pass()
+            self.branch_reshape_expand_pass()
             self.fuse_simple_reshape_pass()
             self.fuse_simple_transpose_pass()
 
@@ -3287,6 +3600,9 @@ class GraphOptimizer(object):
         # Fuse reciprocal and sqrt
         self.fuse_reciprocal_sqrt()
 
+        # Remove additional tile nodes before elementwise ops
+        self.remove_tile_before_binary_elementwise_ops()
+
         # Fuse activation
         self.fuse_activation()
 
@@ -3299,6 +3615,8 @@ class GraphOptimizer(object):
         # Fuse same padding
         self.fuse_same_padding()
         self.fuse_same_padding_slicing()
+
+        self.fuse_gather_conv2d()
 
         # Group conv & deconv
         self.group_conv_rewrite_pass()
@@ -3331,6 +3649,20 @@ def is_bn_fusable_edge(edge: ig.Edge, graph_converter: ig.Graph):
             or source_vertex['op'].fusedActivationFunction
             in (ActivationFunctionType.NONE, target_vertex['op'].fusedActivationFunction)
         )
+    )
+
+
+def is_rev_bn_fusable_edge(edge: ig.Edge, graph_converter: ig.Graph):
+    source_vertex = graph_converter.vs[edge.source]
+    target_vertex = graph_converter.vs[edge.target]
+    return (
+        target_vertex['node_type'] == ExtendedOperator.GENERIC_CONV
+        and source_vertex['node_type'] == ExtendedOperator.BATCH_NORM
+        and source_vertex.outdegree() == 1
+        and source_vertex['op'].inputs[1].buffer is not None
+        and source_vertex['op'].inputs[2].buffer is not None
+        and target_vertex['op'].inputs[1].buffer is not None
+        and source_vertex['op'].fusedActivationFunction == ActivationFunctionType.NONE
     )
 
 
@@ -3476,17 +3808,17 @@ def is_multi_output_op_node(vertex: ig.Vertex, graph_converter: ig.Graph):
     return vertex['node_type'] >= 0 and len(vertex['outputs']) > 1 and vertex.outdegree() > 0
 
 
-def is_quantize_elementwise_op_edge(edge: ig.Edge, graph_converter: ig.Graph):
+def is_quantize_elementwise_op_edge(edge: ig.Edge, graph_converter: ig.Graph, with_lstm: bool):
     source_vertex = graph_converter.vs[edge.source]
     target_vertex = graph_converter.vs[edge.target]
     return (
         (
             source_vertex['node_type'] == ExtendedOperator.DEQUANTIZE
-            and is_quantizable_rewrite_op(target_vertex['node_type'], target_vertex['op'])
+            and is_quantizable_rewrite_op(target_vertex['node_type'], target_vertex['op'], with_lstm)
         )
         or (
             target_vertex['node_type'] == ExtendedOperator.QUANTIZE
-            and is_quantizable_rewrite_op(source_vertex['node_type'], source_vertex['op'])
+            and is_quantizable_rewrite_op(source_vertex['node_type'], source_vertex['op'], with_lstm)
         )
     ) and target_vertex['op'].inputs[0].name in source_vertex['outputs']
 
@@ -3636,7 +3968,7 @@ def is_elementwise_unary_op(op_code: ExtendedOperator, op: tfl.BaseOperator):
     ) or is_elementwise_reduce_op(op_code, op)
 
 
-def is_quantizable_rewrite_op(op_code: ExtendedOperator, op: tfl.BaseOperator):
+def is_quantizable_rewrite_op(op_code: ExtendedOperator, op: tfl.BaseOperator, with_lstm: bool):
     return op_code in (
         ExtendedOperator.BATCH_MATMUL,
         ExtendedOperator.SOFTMAX,
@@ -3647,7 +3979,7 @@ def is_quantizable_rewrite_op(op_code: ExtendedOperator, op: tfl.BaseOperator):
         ExtendedOperator.RSQRT,
         ExtendedOperator.MAXIMUM,
         ExtendedOperator.MINIMUM,
-    )
+    ) or (with_lstm and op_code == ExtendedOperator.UNIDIRECTIONAL_SEQUENCE_LSTM)
 
 
 def is_elementwise_binary_op(op_code: ExtendedOperator, op: tfl.BaseOperator):
@@ -3784,6 +4116,8 @@ def is_slice_fusable_edge(edge: ig.Edge, graph_converter: ig.Graph):
         and target_vertex['node_type'] in (ExtendedOperator.SLICE, ExtendedOperator.STRIDED_SLICE)
         and target_vertex.outdegree() >= 1
         and source_vertex['outputs'][0] == target_vertex['op'].inputs[0].name
+        and source_vertex['op'].inputs[1].buffer is not None
+        and source_vertex['op'].inputs[2].buffer is not None
     )
 
 
@@ -3796,6 +4130,20 @@ def is_transpose_fusable_edge(edge: ig.Edge, graph_converter: ig.Graph):
         and target_vertex['node_type'] == ExtendedOperator.TRANSPOSE
         and target_vertex.outdegree() >= 1
         and source_vertex['outputs'][0] == target_vertex['op'].inputs[0].name
+    )
+
+
+def is_gather_fusable_edge(edge: ig.Edge, graph_converter: ig.Graph):
+    source_vertex = graph_converter.vs[edge.source]
+    target_vertex = graph_converter.vs[edge.target]
+    return (
+        source_vertex['node_type'] == ExtendedOperator.GATHER
+        and source_vertex.outdegree() == 1
+        and target_vertex['node_type'] == ExtendedOperator.GATHER
+        and target_vertex.outdegree() >= 1
+        and source_vertex['outputs'][0] == target_vertex['op'].inputs[0].name
+        and source_vertex['op'].axis == target_vertex['op'].axis
+        and source_vertex['op'].batchDims == target_vertex['op'].batchDims
     )
 
 
@@ -3922,6 +4270,20 @@ def is_conv2d_gather_edge(edge: ig.Edge, graph_converter: ig.Graph):
     )
 
 
+def is_gather_conv2d_edge(edge: ig.Edge, graph_converter: ig.Graph):
+    source_vertex = graph_converter.vs[edge.source]
+    target_vertex = graph_converter.vs[edge.target]
+
+    return (
+        source_vertex['node_type'] == ExtendedOperator.GATHER
+        and target_vertex['node_type'] == ExtendedOperator.CONV_2D
+        and source_vertex.outdegree() == 1
+        and source_vertex['op'].inputs[1].buffer is not None
+        and source_vertex['op'].axis == 3
+        and source_vertex['op'].inputs[1].tensor.shape[0] == target_vertex['op'].inputs[1].tensor.shape[3]
+    )
+
+
 def is_reciprocal_sqrt_edge(edge: ig.Edge, graph_converter: ig.Graph):
     source_vertex = graph_converter.vs[edge.source]
     target_vertex = graph_converter.vs[edge.target]
@@ -3933,15 +4295,32 @@ def is_reciprocal_sqrt_edge(edge: ig.Edge, graph_converter: ig.Graph):
     )
 
 
+def is_tile_binary_op_edge(edge: ig.Edge, graph_converter: ig.Graph):
+    source_vertex = graph_converter.vs[edge.source]
+    target_vertex = graph_converter.vs[edge.target]
+
+    return (
+        source_vertex['node_type'] == ExtendedOperator.TILE
+        and target_vertex['node_type']
+        in (
+            ExtendedOperator.ADD,
+            ExtendedOperator.SUB,
+            ExtendedOperator.MUL,
+            ExtendedOperator.DIV,
+        )
+        and source_vertex.outdegree() == 1
+    )
+
+
 def op_input_dims(op: tfl.BaseOperator):
     dim_indices = None
 
     if isinstance(op, (tfl.ConcatenationOperator, tfl.GatherOperator, tfl.PackOperator, tfl.UnpackOperator)):
         dim_indices = op.axis
     elif isinstance(op, tfl.SplitOperator):
-        dim_indices = op.inputs[0].tensor[0]
+        dim_indices = op.inputs[0].tensor.item()
     elif isinstance(op, tfl.SplitVOperator):
-        dim_indices = op.inputs[2].tensor[0]
+        dim_indices = op.inputs[2].tensor.item()
     elif isinstance(op, (tfl.PadOperator, tfl.Padv2Operator, tfl.MirrorPadOperator)):
         pads = np.sum(op.inputs[1].tensor, axis=-1)
         nonzero_idx = np.nonzero(pads)[0]
@@ -4022,6 +4401,33 @@ def fuse_bn_bias(eps, scale, var, mean, bn_b, activ_b):
         return (-mean) * inv * scale + bn_b
 
 
+def fuse_rev_bn_weight(eps, scale, var, weight):
+    shape = [1, -1] + [1] * (len(weight.shape) - 2)
+
+    inv = 1 / np.sqrt(var + eps)
+
+    return weight * (scale * inv).reshape(shape)
+
+
+def fuse_rev_bn_bias(eps, scale, var, mean, bn_b, activ_b, weight):
+    reduced_dims = tuple([i for i in range(len(weight.shape)) if i > 1])
+
+    inv = 1 / np.sqrt(var + eps)
+    fused_b = bn_b - mean * inv * scale
+
+    if weight.shape[1] == 1 and mean.shape[0] > 1:
+        offset_b = (weight.sum(reduced_dims) * fused_b.reshape(-1, 1)).reshape(-1)
+    else:
+        offset_b = np.matmul(weight.sum(reduced_dims), fused_b.reshape(-1, 1)).reshape(-1)
+
+    if activ_b is not None:
+        if activ_b.shape != mean.shape and activ_b.ndim == 1 and activ_b.size == 1:
+            activ_b = activ_b.repeat(mean.size)
+        return activ_b + offset_b
+    else:
+        return offset_b
+
+
 def fuse_slices(seq: typing.Iterable[ig.Vertex]):
     cur_start = None
     cur_end = None
@@ -4055,7 +4461,7 @@ def fuse_slices(seq: typing.Iterable[ig.Vertex]):
 def fuse_transpose_perms(seq: typing.Iterable[ig.Vertex]):
     cur_perm = None
     for node in seq:
-        assert node['node_type'] == ExtendedOperator.TRANSPOSE
+        assert node['node_type'] in (ExtendedOperator.TRANSPOSE, ExtendedOperator.GATHER)
         next_perm = node['op'].inputs[1].tensor
         if cur_perm is None:
             cur_perm = next_perm
@@ -4086,15 +4492,25 @@ def fuse_transpose_perms_extended(seq: typing.Iterable[ig.Vertex]):
                 old_shape = node['op'].outputs[0].shape
 
             if old_shape != new_shape:
-                new_shape_padded = list(new_shape) + [None] * (len(old_shape) - len(new_shape))
-                next_perm = []
-                new_idx = 0
-                while new_idx < len(new_shape):
-                    for old, item in zip(old_shape, cur_perm):
-                        if old == new_shape_padded[new_idx] and item not in next_perm:
-                            next_perm.append(item)
-                            new_idx += 1
-                cur_perm = np.argsort(next_perm)
+                if len(old_shape) != len(new_shape):
+                    new_shape_padded = list(new_shape) + [None] * (len(old_shape) - len(new_shape))
+                    next_perm = []
+                    new_idx = 0
+                    while new_idx < len(new_shape):
+                        for old, item in zip(old_shape, cur_perm):
+                            if old == new_shape_padded[new_idx] and item not in next_perm:
+                                next_perm.append(item)
+                                new_idx += 1
+                    cur_perm = np.argsort(next_perm)
+                else:
+                    mapping = {}
+                    for i in range(len(new_shape)):
+                        mapping.setdefault(new_shape[i], [])
+                        mapping[new_shape[i]].append(i)
+                    next_perm = [0] * len(old_shape)
+                    for i in range(len(old_shape)):
+                        next_perm[i] = mapping[old_shape[i]].pop(0)
+                    cur_perm = cur_perm[next_perm]
 
     return cur_perm
 
@@ -4245,7 +4661,7 @@ def elinimate_sequences(
         first_node = seq[0]
         last_node = seq[-1]
 
-        if type(skip_pred) == bool:
+        if type(skip_pred) is bool:
             skip = skip_pred
         elif skip_pred is not None:
             skip = skip_pred(seq)
@@ -4253,13 +4669,13 @@ def elinimate_sequences(
         if skip:
             continue
 
-        if type(remove_first_pred) == bool:
+        if type(remove_first_pred) is bool:
             remove_first = remove_first_pred
             custom_data = None
         elif remove_first_pred is not None:
             remove_first, custom_data = remove_first_pred(seq)
 
-        if type(remove_last_pred) == bool:
+        if type(remove_last_pred) is bool:
             remove_last = remove_last_pred
             custom_data_last = None
         elif remove_last_pred is not None:

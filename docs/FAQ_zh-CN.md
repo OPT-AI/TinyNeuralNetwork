@@ -63,6 +63,54 @@ with model_tracer():
     qat_model = quantizer.quantize()
 ```
 
+Q： 如何按照算子类型指定混合量化？
+
+A：在Quantizer初始化时配置config中的quantize_op_action参数，需要指定不量化的行为，'disable'表示完全不量化，'rewrite'表示不量化但是保留OP输入输出的量化参数。
+```python
+# 需要对含LSTM OP的模型进行混合量化，保留其输入的量化参数，方便后续直接在converter中进行量化。
+with model_tracer():
+    quantizer = QATQuantizer(model, dummy_input, work_dir='out', config={ 'quantize_op_action': {nn.LSTM: 'rewrite'} })
+    qat_model = quantizer.quantize()
+```
+
+#### 如何配置更加灵活的Qconfig？
+Q: 如何在设置不同的量化配置，例如为不同的层指定不同的量化Observer？
+
+A: 在`Quantizer`初始化时配置config中的`override_qconfig_func`参数，自定义一个函数用于修改对应算子的Qconfig，以下是按照不同的module name或module type设定MinMaxObserver的方式。更多的`FakeQuantize`和`Observer`可以从`torch.quantization`官方实现中进行选取，或者[自定义相关实现](../tinynn/graph/quantization/fake_quantize.py)。
+
+module_name 可以从生成的out/Qxx.py模型定义中获知。
+
+```python
+import torch
+from torch.quantization import FakeQuantize, MinMaxObserver
+form torch.ao.nn.intrinsic import ConvBnReLU2d
+def set_ptq_fake_quantize_1(name, module):
+   # 按照model_name和module_type 将对应weight和激活值的OBserver设置为MinMaxObserver。
+   if name in ['model_0_0', 'model_0_1'] or isinstance(module, ConvBnReLU2d):
+        weight_fq = FakeQuantize.with_args(
+            observer=MinMaxObserver,
+            quant_min=-128,
+            quant_max=127,
+            dtype=torch.qint8,
+            qscheme=torch.per_tensor_symmetric,
+            reduce_range=False,
+        )
+        act_fq = FakeQuantize.with_args(
+            observer=MinMaxObserver,
+            quant_min=0,
+            quant_max=255,
+            dtype=torch.quint8,
+            reduce_range=False,
+        )
+        qconfig_new = torch.quantization.QConfig(act_fq, weight_fq)
+        return qconfig_new
+```
+```python
+with model_tracer():
+    quantizer = QATQuantizer(model, dummy_input, work_dir='out', config={'override_qconfig_func': set_MinMaxObserver})
+    qat_model = quantizer.quantize()
+```
+
 
 #### 如何处理训练和推理计算图不一致的情况？
 
@@ -221,11 +269,12 @@ Note: 这些状态变量都是二维的，维度为`[batch_size, hidden_size或�
 通常情况下，当隐层数量较大时（如128及以上）LSTM的模型在TFLite中会比较耗时。这种情况下，可以考虑使用动态范围量化来优化其性能，参见[dynamic.py](../examples/converter/dynamic.py)。
 
 对于使用PyTorch 1.13+版本的用户，也可以尝试对LSTM进行静态量化。但是全量化LSTM通常是较为困难的，可能需要比较细致的按层量化误差分析。
+当然对于新版本TFLite中的Int16 LSTM，我们也进行了支持，可以参考[ptq_with_dynamic_q_lstm.py](../examples/quantization/ptq_with_dynamic_q_lstm.py)。
 
 #### 我的模型开了动态量化变得更慢了？
 请参考 [dynamic_with_selection.py](../examples/converter/dynamic_with_selection.py) 选择性的开启动态量化。
 
-#### 在设置了`unroll_rnn=True`后，LSTM中多个门的计算被融合了。有没有办法分开？
+#### 在设置了`unroll_rnn=True`后，LSTM/GRU中多个门的计算被融合了。有没有办法分开？
 尝试设置`separated_rnn_gate_calc=True`。
 
 #### 在`unroll_rnn=True`的情况下，怎么为包含LSTM、RNN和GRU的网络添加状态输入输出?
@@ -279,7 +328,7 @@ from onnx2pytorch import ConvertModel
 ```py
 # Import import_patcher from TinyNN
 from tinynn.graph.tracer import import_patcher
-# Apply import_patcher during module  for onnx2torch
+# Apply import_patcher during module import for onnx2torch
 with import_patcher():
     from onnx2torch import convert
 

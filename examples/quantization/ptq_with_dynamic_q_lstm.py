@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 
 from tinynn.converter import TFLiteConverter
+from tinynn.graph.quantization.quantizer import PostQuantizer
 
 
 class SimpleLSTM(nn.Module):
@@ -33,29 +34,44 @@ def main_worker(args):
     # Provide a viable input for the model
     dummy_input = torch.rand((args.steps, args.batch_size, args.input_size))
 
-    print(model)
+    # Please see 'ptq.py' for more details for using PostQuantizer.
+    quantizer = PostQuantizer(model, dummy_input, work_dir='out', config={'quantize_op_action': {nn.LSTM: 'rewrite'}})
+    ptq_model = quantizer.quantize()
+
+    print(ptq_model)
+
+    for _ in range(5):
+        ptq_model(torch.rand_like(dummy_input))
 
     with torch.no_grad():
-        model.eval()
-        model.cpu()
+        ptq_model.eval()
+        ptq_model.cpu()
+
+        # The step below converts the model to an actual quantized model, which uses the quantized kernels.
+        ptq_model = quantizer.convert(ptq_model)
+
+        print(ptq_model)
+
+        # When converting quantized models, please ensure the quantization backend is set.
+        torch.backends.quantized.engine = quantizer.backend
 
         # The code section below is used to convert the model to the TFLite format
         converter = TFLiteConverter(
-            model,
+            ptq_model,
             dummy_input,
-            tflite_path='out/dynamic_quant_model.tflite',
-            strict_symmetric_check=True,
+            tflite_path='out/ptq_with_dynamic_quant_lstm_model.tflite',
             quantize_target_type='int8',
+            rewrite_quantizable=True,
             # Enable hybrid quantization
             hybrid_quantization_from_float=True,
             # Enable hybrid per-channel quantization (lower q-loss, but slower)
             hybrid_per_channel=False,
             # Use asymmetric inputs for hybrid quantization (probably lower q-loss, but a bit slower)
-            hybrid_asymmetric_inputs=True,
-            # Enable hybrid per-channel quantization for `Conv2d` and `DepthwiseConv2d`
-            hybrid_conv=True,
+            hybrid_asymmetric_inputs=False,
+            # Enable int16 hybrid lstm quantization
+            hybrid_int16_lstm=True,
             # Enable rewrite for BidirectionLSTMs to UnidirectionalLSTMs
-            map_bilstm_to_lstm=False,
+            map_bilstm_to_lstm=True,
         )
         converter.convert()
 

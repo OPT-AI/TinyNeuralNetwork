@@ -10,8 +10,8 @@ from .operators import CommonGraph, ExtendedOperator, GraphOptimizer, HybridQuan
 from .operators.op_version import OPVersioner
 from .operators.tflite import Tensor
 from .operators.torch import OPERATOR_CONVERTER_DICT
-from .operators.torch.base import NoTrackOperator, TrackQParamsOperator
-from .operators.torch.aten import ATenDequantizeOperator
+from .operators.torch.base import NoTrackOperator, TrackRevQParamsOperator, TrackQParamsOperator
+from .operators.torch.aten import ATenDequantizeOperator, ATenQuantizePerTensorOperator
 from ..util.converter_util import generate_converter_config
 from ..util.util import get_logger
 
@@ -52,12 +52,15 @@ class TFLiteConverter(object):
         conv_transpose_with_bias: bool = True,
         max_transpose_dims: int = -1,
         hybrid_conv: bool = True,
+        hybrid_int16_lstm: bool = False,
         unroll_rnn: bool = False,
         separated_rnn_gate_calc: bool = False,
         bypass_elementwise_passthrough_constraint: bool = False,
         hybrid_gen_single_op_models: bool = False,
         hybrid_config: typing.Optional[typing.Dict[str, bool]] = None,
         group_tensors: bool = False,
+        missing_outputs_as_constants: bool = False,
+        legacy_gelu: bool = False,
     ) -> None:
         """ The TFLiteConverter class
 
@@ -102,6 +105,7 @@ class TFLiteConverter(object):
             conv_transpose_with_bias (bool): ConvTranspose ops with bias. Defaults to True
             max_transpose_dims (int): Max dimensions for the `Transpose` op. Defaults to -1, which means unlimited
             hybrid_conv (bool): Enable hybrid quantization for Conv2d and DepthwiseConv2d. Defaults to True
+            hybrid_int16_lstm (bool): Enable hybrid int16 quantization for LSTM. Defaults to False
             unroll_rnn (bool): Unrolling LSTM (translate LSTM to seperate ops). Defaults to False
             separated_rnn_gate_calc (bool): Separated calculation for every gate in RNN. Effective only when \
                 `unroll_rnn=True`. Defaults to False
@@ -110,6 +114,8 @@ class TFLiteConverter(object):
             hybrid_gen_single_op_models: Generate both floating point and quantized version of the model for hybrid \
                 quantizable ops. Defaults to False
             group_tensors (bool): Group tensors to save space. Defaults to False
+            missing_outputs_as_constants (bool): View missing outputs as constants. Defaults to False
+            legacy_gelu (bool): Fallback to the legacy behaviour for translating gelu. Defaults to False
         """
 
         self.model = model
@@ -158,12 +164,15 @@ class TFLiteConverter(object):
         self.conv_transpose_with_bias = conv_transpose_with_bias
         self.max_transpose_dims = max_transpose_dims
         self.hybrid_conv = hybrid_conv
+        self.hybrid_int16_lstm = hybrid_int16_lstm
         self.unroll_rnn = unroll_rnn
         self.separated_rnn_gate_calc = separated_rnn_gate_calc
         self.bypass_elementwise_passthrough_constraint = bypass_elementwise_passthrough_constraint
         self.hybrid_gen_single_op_models = hybrid_gen_single_op_models
         self.hybrid_config = hybrid_config
         self.group_tensors = group_tensors
+        self.missing_outputs_as_constants = missing_outputs_as_constants
+        self.legacy_gelu = legacy_gelu
 
         if quantize_target_type == 'uint8':
             self.q_type = np.uint8
@@ -205,7 +214,9 @@ class TFLiteConverter(object):
         elif hybrid_quantize_weight_type == 'int8':
             self.hybrid_q_type = np.int8
         elif hybrid_quantize_weight_type == 'int16':
-            raise AttributeError('Hybrid kernels supports int8 and uint8 only')
+            self.hybrid_q_type = np.int16
+            if self.hybrid:
+                raise AttributeError('Hybrid kernels supports int8 and uint8 only')
 
         if dump_config_path and not dump_jit_model_path:
             raise AssertionError("when dump_config_path is set, dump_jit_model_path is required to be set")
@@ -386,6 +397,8 @@ class TFLiteConverter(object):
     def init_operations(self):
         log.debug('Initialize operators...')
         node_queue = collections.deque(self.graph.nodes())
+        scope_map = {}
+        current_scope = None
         while node_queue:
             node = node_queue.popleft()
 
@@ -396,6 +409,7 @@ class TFLiteConverter(object):
             converter = converter_type(
                 node,
                 self.tensor_map,
+                current_scope,
                 not self.strict_symmetric_check,
                 self.q_type,
                 self.hybrid_q_type,
@@ -405,6 +419,7 @@ class TFLiteConverter(object):
                 self.unroll_rnn,
                 self.separated_rnn_gate_calc,
                 self.conv_transpose_with_bias,
+                self.legacy_gelu,
             )
             # Don't track the operator if all the input nodes are not tracked unless it has custom implementation
             # (e.g prim::* ops)
@@ -414,24 +429,38 @@ class TFLiteConverter(object):
                     if self.common_graph.has_nested_names(n):
                         nested_names = self.common_graph.get_list_expanded_names(n)
                         for x in nested_names:
-                            if x in self.common_graph.tensor_map:
+                            if x in self.common_graph.tensor_map and self.common_graph.tensor_map[x].buffer is None:
                                 no_track_flag = False
                                 break
-                    elif n in self.common_graph.tensor_map:
+                    elif n in self.common_graph.tensor_map and self.common_graph.tensor_map[n].buffer is None:
                         no_track_flag = False
                         break
                 if no_track_flag:
                     if converter_type == ATenDequantizeOperator:
                         converter_type = TrackQParamsOperator
+                    elif converter_type == ATenQuantizePerTensorOperator:
+                        converter_type = TrackRevQParamsOperator
                     else:
                         converter_type = NoTrackOperator
                     converter = converter_type(
-                        node, self.tensor_map, not self.strict_symmetric_check, self.q_type, self.hybrid_q_type
+                        node,
+                        self.tensor_map,
+                        current_scope,
+                        not self.strict_symmetric_check,
+                        self.q_type,
+                        self.hybrid_q_type,
+                        self.map_bilstm_to_lstm,
+                        self.enable_mtk_ops,
+                        self.hybrid_asymmetric_inputs,
+                        self.unroll_rnn,
+                        self.separated_rnn_gate_calc,
+                        self.conv_transpose_with_bias,
+                        self.legacy_gelu,
                     )
             if k != 'prim::Constant':
                 log.debug(f'{k} {converter.input_names} -> {converter.output_names} {converter_type.__name__}')
             # Don't fetch attrs and schemas for non-tracking nodes
-            if converter_type not in (NoTrackOperator, TrackQParamsOperator):
+            if converter_type not in (NoTrackOperator, TrackRevQParamsOperator, TrackQParamsOperator):
                 try:
                     attrs = converter.fetch_all_attrs(node)
                 except StopIteration:
@@ -447,6 +476,15 @@ class TFLiteConverter(object):
                 output_tensors.extend(converter.get_output_tensors())
             if len(new_nodes) > 0:
                 node_queue.extendleft(reversed(new_nodes))
+
+            if k == 'prim::PythonOp':
+                s = node.scopeName()
+                scope_map.setdefault(s, 0)
+                scope_map[s] += 1
+                current_scope = f'{s}_{scope_map[s]}'
+                converter.prepare_scope_tensors(node, attrs, args, self.common_graph, current_scope)
+            elif k == 'prim::Return':
+                current_scope = None
 
             assert len(output_tensors) == len(outputs)
             for t, name in zip(output_tensors, outputs):
@@ -497,6 +535,8 @@ class TFLiteConverter(object):
                 self.max_transpose_dims,
                 self.bypass_elementwise_passthrough_constraint,
                 self.group_tensors,
+                self.conv_transpose_with_bias,
+                self.hybrid_int16_lstm,
             )
             optimizer.optimize()
 
@@ -509,6 +549,7 @@ class TFLiteConverter(object):
                     self.hybrid_q_type,
                     self.hybrid_per_channel,
                     self.hybrid_conv,
+                    self.hybrid_int16_lstm,
                     self.hybrid_gen_single_op_models,
                     self.hybrid_config,
                 )
@@ -522,6 +563,22 @@ class TFLiteConverter(object):
 
             versioner = OPVersioner(self.common_graph)
             versioner.process()
+
+            if self.missing_outputs_as_constants:
+                tensors = []
+                for output_name in self.common_graph.outputs:
+                    if output_name not in self.common_graph.tensor_map:
+                        tensors.append(
+                            Tensor(
+                                self.tensor_map[output_name],
+                                output_name,
+                                has_buffer=True,
+                                asymmetric=not self.strict_symmetric_check,
+                                q_type=self.q_type,
+                            )
+                        )
+                self.common_graph.add_nodes(tensors, ExtendedOperator.CONSTANT_NODE)
+                self.common_graph.add_outputs([t.name for t in tensors])
 
             self.common_graph.convert(self.tflite_path)
 

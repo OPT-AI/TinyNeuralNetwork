@@ -63,6 +63,56 @@ with model_tracer():
     qat_model = quantizer.quantize()
 ```
 
+Q: How to specify mixed quantization according to operator types?
+
+A: Configure the quantize_op_action parameter in the config during Quantizer initialization. You need to specify the actions for non-quantized operators: 'disable' means completely non-quantized, and 'rewrite' means not quantized but retaining the quantization parameters of the operator's inputs and outputs.
+
+```python
+# For a model containing LSTM op, perform mixed quantization while retaining the quantization parameters of its inputs, facilitating subsequent quantization directly in the converter.
+with model_tracer():
+    quantizer = QATQuantizer(model, dummy_input, work_dir='out', config={ 'quantize_op_action': {nn.LSTM: 'rewrite'} })
+    qat_model = quantizer.quantize()
+```
+
+
+#### How to set a more flexible Qconfig?
+Q: How to set different quantization configurations, such as specifying different quantization observers for different layers?
+
+A: Configure the `override_qconfig_func` parameter in the config during `Quantizer` initialization. This requires the user to define a function that modifies the Qconfig for the corresponding Op. Below is an example to set MinMaxObservers based on different module name or module type. More `FakeQuantize` and `Observer` implementations can be selected from the official `torch.quantization` library, or you can [customize your own implementations](../tinynn/graph/quantization/fake_quantize.py).
+
+module_name can be obtained from the generated traced model definition in out/Qxx.py.
+
+```python
+import torch
+from torch.quantization import FakeQuantize, MinMaxObserver
+form torch.ao.nn.intrinsic import ConvBnReLU2d
+def set_MinMaxObserver(name, module):
+   # Set the corresponding weight and activation observers to MinMaxObserver based on model_name and module_type.
+   if name in ['model_0_0', 'model_0_1'] or isinstance(module, ConvBnReLU2d):
+        weight_fq = FakeQuantize.with_args(
+            observer=MinMaxObserver,
+            quant_min=-128,
+            quant_max=127,
+            dtype=torch.qint8,
+            qscheme=torch.per_tensor_symmetric,
+            reduce_range=False,
+        )
+        act_fq = FakeQuantize.with_args(
+            observer=MinMaxObserver,
+            quant_min=0,
+            quant_max=255,
+            dtype=torch.quint8,
+            reduce_range=False,
+        )
+        qconfig_new = torch.quantization.QConfig(act_fq, weight_fq)
+        return qconfig_new
+```
+```python
+with model_tracer():
+    quantizer = QATQuantizer(model, dummy_input, work_dir='out', config={'override_qconfig_func': set_MinMaxObserver})
+    qat_model = quantizer.quantize()
+```
+
 
 #### How to handle the case of inconsistent training and inference computation graphs?
 
@@ -221,11 +271,12 @@ Note: These state variables are all two-dimensional with the shape of `[batch_si
 Usually, when the number of hidden layers is large enough (128+), the LSTM OP will be time-consuming in the TFLite backend. In this case, consider using dynamic range quantization to optimize its performance, see [dynamic.py](../examples/converter/dynamic.py).
 
 You may also try out static quantization for LSTMs when you have PyTorch 1.13+. But it may take much more effort to minimize the quantization error, and you probably need to perform per-layer inspection carefully.
+We also support int16 LSTM via the combination of static quantization and LSTM-only dynamic quantization. Please take a look at [ptq_with_dynamic_q_lstm.py](../examples/quantization/ptq_with_dynamic_q_lstm.py).
 
 #### What if my model runs slower when dynamic quantization is enabled?
 Please refer to [dynamic_with_selection.py](../examples/converter/dynamic_with_selection.py) for selective dynamic quantization.
 
-#### I need LSTMs with separated gate calculation when `unroll_rnn=True`.
+#### I need LSTM/GRUs with separated gate calculation when `unroll_rnn=True`.
 Please set `separated_rnn_gate_calc=True`.
 
 #### How to add state inputs and outputs for LSTMs/GRUs/RNNs with `unroll_rnn=True`?
@@ -279,7 +330,7 @@ from onnx2pytorch import ConvertModel
 ```py
 # Import import_patcher from TinyNN
 from tinynn.graph.tracer import import_patcher
-# Apply import_patcher during module  for onnx2torch
+# Apply import_patcher during module import for onnx2torch
 with import_patcher():
     from onnx2torch import convert
 

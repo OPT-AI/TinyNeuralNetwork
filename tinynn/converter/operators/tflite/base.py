@@ -6,6 +6,9 @@ import numpy as np
 import torch
 
 from ...schemas.tflite import schema_generated as tflite
+from tinynn.util.util import get_logger
+
+log = get_logger(__name__)
 
 Offset = int
 
@@ -45,6 +48,7 @@ class OpCode(object):
 class BaseOperator(object):
     inputs: typing.List['Tensor']
     outputs: typing.List['Tensor']
+    intermediates: typing.List['Tensor']
     op: OpCode
     tfl_op: Offset
     tfl_inputs_idx: typing.Iterable[int]
@@ -54,22 +58,26 @@ class BaseOperator(object):
     def __init__(self, op: int, inputs: typing.List['Tensor'], outputs: typing.List['Tensor'], op_version: int = 1):
         self.inputs = inputs
         self.outputs = outputs
+        self.intermediates = []
         self.op = OpCode(op, op_version)
 
         self.tfl_op = 0
         self.tfl_inputs_idx = []
         self.tfl_outputs_idx = []
+        self.tfl_intermediates_idx = []
 
         self.extra_hints = {}
 
     def build(self, builder: flatbuffers.Builder) -> Offset:
         tfl_inputs_idx = create_numpy_array(builder, tflite.Operator.Inputs, self.tfl_inputs_idx)
         tfl_outputs_idx = create_numpy_array(builder, tflite.Operator.Outputs, self.tfl_outputs_idx)
+        tfl_intermediates_idx = create_numpy_array(builder, tflite.Operator.Intermediates, self.tfl_intermediates_idx)
 
         tflite.OperatorStart(builder)
         tflite.OperatorAddOpcodeIndex(builder, self.op.index)
         tflite.OperatorAddInputs(builder, tfl_inputs_idx)
         tflite.OperatorAddOutputs(builder, tfl_outputs_idx)
+        tflite.OperatorAddIntermediates(builder, tfl_intermediates_idx)
         self.tfl_op = tflite.OperatorEnd(builder)
 
         return self.tfl_op
@@ -178,7 +186,7 @@ class Tensor(object):
         self.index = 0
         self.is_variable = is_variable
 
-        if type(tensor) == FakeQuantTensor:
+        if type(tensor) is FakeQuantTensor:
             self.quantization = QuantizationParameters(tensor.scale, tensor.zero_point, tensor.dim)
             tensor = tensor.tensor
 
@@ -187,7 +195,7 @@ class Tensor(object):
 
         if type(tensor).__module__ == 'numpy':
             self.tensor = tensor
-        elif type(tensor) == torch.Tensor:
+        elif type(tensor) is torch.Tensor:
             assert tensor.is_contiguous, "Tensor should be contiguous"
             if tensor.dtype == torch.quint8:
                 self.tensor = torch.int_repr(tensor.detach()).numpy()
@@ -196,12 +204,13 @@ class Tensor(object):
                 else:
                     if not asymmetric:
                         sym_u8_offset = 128
-                        assert tensor.q_zero_point() == sym_u8_offset, (
-                            "As for symmetric quantization, the zero point of the u8 tensors should be"
-                            f" {sym_u8_offset}, but got {tensor.q_zero_point()}. This could happen if you didn't train"
-                            " the model after QAT preparation, or the OP is not supported in symmetric quantization"
-                            " (e.g. sigmoid)"
-                        )
+                        if tensor.q_zero_point() != sym_u8_offset:
+                            log.warning(
+                                "As for symmetric quantization, the zero point of the u8 tensors should be"
+                                f" {sym_u8_offset}, but got {tensor.q_zero_point()}. This could happen if you didn't"
+                                " train the model after QAT preparation, or the OP is not supported in symmetric"
+                                " quantization (e.g. sigmoid)"
+                            )
                     else:
                         sym_u8_offset = tensor.q_zero_point()
                     scale = tensor.q_scale()
@@ -244,7 +253,7 @@ class Tensor(object):
                         self.quantization = QuantizationParameters(scales, zero_points, dim)
             else:
                 self.tensor = tensor.detach().numpy()
-        elif type(tensor) == torch.Size:
+        elif type(tensor) is torch.Size:
             self.tensor = np.asarray(tensor, dtype='int32')
         elif type(tensor) in (tuple, list):
             self.tensor = np.asarray(tensor, dtype=dtype)
@@ -381,7 +390,7 @@ class Model(object):
 def create_offset_vector(builder: flatbuffers.Builder, prop: typing.Callable, vec: typing.Iterable):
     if type(vec) not in (tuple, list):
         assert False, "type of vec unexpected, expected: list or tuple"
-    elif type(vec) == tuple:
+    elif type(vec) is tuple:
         vec = list(vec)
 
     prop_name = prop.__name__
@@ -417,7 +426,7 @@ def create_numpy_array(builder: flatbuffers.Builder, prop: typing.Callable, vec:
 
 
 def create_string(builder: flatbuffers.Builder, prop: typing.Callable, val: str):
-    if type(val) != str:
+    if type(val) is not str:
         assert False, "type of val unexpected, expected: str"
 
     prop_name = prop.__name__

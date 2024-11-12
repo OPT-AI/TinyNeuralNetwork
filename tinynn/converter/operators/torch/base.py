@@ -21,6 +21,7 @@ class OperatorConverter(ABC):
         self,
         node,
         tensor_map,
+        scope_name,
         asymmetric=True,
         q_type=np.uint8,
         hybrid_q_type=np.int8,
@@ -30,7 +31,9 @@ class OperatorConverter(ABC):
         unroll_rnn=False,
         separated_rnn_gate_calc=False,
         conv_transpose_with_bias=True,
+        legacy_gelu=False,
     ) -> None:
+        self.scope_name = scope_name
         self.input_names = self.get_input_names(node)
         self.output_names = self.get_output_names(node)
         self.input_tensors = self.get_input_tensors(tensor_map)
@@ -48,16 +51,26 @@ class OperatorConverter(ABC):
         self.unroll_rnn = unroll_rnn
         self.separated_rnn_gate_calc = separated_rnn_gate_calc
         self.conv_transpose_with_bias = conv_transpose_with_bias
+        self.legacy_gelu = legacy_gelu
 
     @abstractmethod
     def parse(self, node, attrs, args, graph_converter):
         pass
 
+    def get_tensor_name(self, tensor_name, scope_name=None):
+        if scope_name is None:
+            scope_name = self.scope_name
+
+        if scope_name:
+            return f'{scope_name}_{tensor_name}'
+        else:
+            return tensor_name
+
     def get_input_names(self, node):
-        return [x.debugName() for x in list(node.inputs())]
+        return [self.get_tensor_name(x.debugName()) for x in list(node.inputs())]
 
     def get_output_names(self, node):
-        return [x.debugName() for x in list(node.outputs())]
+        return [self.get_tensor_name(x.debugName()) for x in list(node.outputs())]
 
     def get_input_tensors(self, tensor_map):
         input_tensors = []
@@ -177,7 +190,7 @@ class OperatorConverter(ABC):
         tfl_tensors = []
         if has_buffers is None:
             has_buffers = [None] * len(tensors)
-        elif type(has_buffers) == bool:
+        elif type(has_buffers) is bool:
             has_buffers = [has_buffers] * len(tensors)
         assert len(names) == len(tensors) == len(has_buffers)
         for n, t, b in zip(names, tensors, has_buffers):
@@ -478,7 +491,7 @@ class OperatorConverter(ABC):
             input_size = [input_tensor.shape[2], input_tensor.shape[3]]
 
             if not all((i + 2 * p - k) % s == 0 for i, p, k, s in zip(input_size, padding, kernel_size, stride)):
-                assert type(ops[1]) == tfl.MaxPool2dOperator, 'ceil_mode=True for AvgPool not supported'
+                assert type(ops[1]) is tfl.MaxPool2dOperator, 'ceil_mode=True for AvgPool not supported'
                 fill_nan = True
                 ceil_pad = get_pool_ceil_padding(input_tensor, kernel_size, stride, padding)
                 ceil_pad = list(np.add(ceil_pad, padding))
@@ -490,7 +503,7 @@ class OperatorConverter(ABC):
             pad_input = ops[pad_op_index - 1].outputs[0]
 
             inputs = [pad_input, pad_tensor]
-            if type(ops[1]) == tfl.MaxPool2dOperator:
+            if type(ops[1]) is tfl.MaxPool2dOperator:
                 constant_tensor = self.get_minimum_constant(pad_input)
                 inputs.append(constant_tensor)
                 pad_array = np.pad(pad_input.tensor, pad, constant_values=constant_tensor.tensor[0])
@@ -651,7 +664,7 @@ class OperatorConverter(ABC):
 
     def torch_tensor_from_scalar(self, ref_tensor: torch.Tensor, src_tensor: torch.Tensor):
         tgt_tensor = src_tensor
-        if type(src_tensor) != torch.Tensor:
+        if not isinstance(src_tensor, torch.Tensor):
             if ref_tensor.is_quantized:
                 tgt_tensor = torch.quantize_per_tensor(
                     torch.tensor([src_tensor], dtype=torch.float32),
@@ -676,6 +689,8 @@ def get_prop_from_node(node, prop, assert_type=None, return_type=False):
         elif vk == 'f':
             v = getattr(node, vk)(prop)
         elif vk == 's':
+            v = getattr(node, vk)(prop)
+        elif vk == 'g':
             v = getattr(node, vk)(prop)
         elif vk == 't':
             v = getattr(node, vk)(prop)
@@ -755,6 +770,26 @@ class TrackQParamsOperator(OperatorConverter):
 
         t = self.find_or_create_input(0, graph_converter)
         graph_converter.q_mapping[self.output_names[0]] = t
+
+
+class TrackRevQParamsOperator(OperatorConverter):
+    def parse(self, node, attrs, args, graph_converter):
+        super().parse(node, attrs, args, graph_converter)
+
+        self.run(node)
+
+        t = self.to_tfl_tensors(self.output_names, self.output_tensors)[0]
+        graph_converter.rev_q_mapping[self.input_names[0]] = t
+
+
+class TrackConstantOperator(OperatorConverter):
+    def parse(self, node, attrs, args, graph_converter):
+        super().parse(node, attrs, args, graph_converter)
+
+        self.run(node)
+
+        t = self.find_or_create_input(0, graph_converter)
+        graph_converter.constant_mapping[self.output_names[0]] = t
 
 
 class PrimOperatorConverter(OperatorConverter):

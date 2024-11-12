@@ -22,6 +22,7 @@ Quantized OPs that are natively not supported by PyTorch (and possibly TFLite). 
 | `log_softmax` | / |
 | `matmul` | / |
 | `mm` | / |
+| `norm` | / |
 | `pad` | 1.7.0 |
 | `pow` | / |
 | `prelu` | / |
@@ -46,6 +47,7 @@ Quantized OPs that are natively not supported by PyTorch (and possibly TFLite). 
 | `torch.nn.LayerNorm` | / |
 | `torch.nn.LogSoftmax` | / |
 | `torch.nn.PReLU` | / |
+| `torch.nn.RMSNorm` | / |
 | `torch.nn.RNN` | / |
 | `torch.nn.SiLU` | / |
 | `torch.nn.Softmax` | / |
@@ -81,6 +83,8 @@ Quantized OPs that are natively not supported by PyTorch (and possibly TFLite). 
 | `{add, relu6}` |  |
 | `{add, torch.nn.ReLU6}` |  |
 | `{torch.nn.BatchNorm2d, clamp}` |  |
+| `{torch.nn.BatchNorm2d, torch.nn.Conv2d}` | PTQ only. |
+| `{torch.nn.BatchNorm2d, torch.nn.Conv2d, torch.nn.ReLU}` | PTQ only. |
 | `{torch.nn.BatchNorm2d, torch.nn.ReLU}` |  |
 | `{torch.nn.BatchNorm2d, torch.nn.ReLU6}` |  |
 | `{torch.nn.BatchNorm3d, torch.nn.ReLU}` |  |

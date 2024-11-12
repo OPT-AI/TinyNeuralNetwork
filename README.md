@@ -5,7 +5,7 @@ TinyNeuralNetwork is an efficient and easy-to-use deep learning model compressio
 
 ## Installation
 
-Python >= 3.6, PyTorch >= 1.4（ PyTorch >= 1.6 if quantization-aware training is involved ）
+Python >= 3.9, PyTorch >= 1.10
 
 ```shell
 # Install the TinyNeuralNetwork framework
